@@ -7,5 +7,8 @@ numpy>=1.21.0
 opencv-python>=4.5.0
 Pillow>=9.0.0
 pycocotools>=2.0.6
+matplotlib
+transformers>=4.30.0
+huggingface_hub
 ruff
 ty

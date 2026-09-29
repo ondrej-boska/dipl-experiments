@@ -25,7 +25,7 @@ class OMRDataset(Dataset):
         img_path = next(json_path.parent.glob("*.jpg"))
         
         with open(json_path, 'r') as f:
-            coco_data = json.load(f)
+            coco_data: dict = json.load(f)
             
         image = Image.open(img_path).convert("RGB")
         
