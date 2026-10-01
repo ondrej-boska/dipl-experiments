@@ -6,15 +6,11 @@ Evaluates Symbol Error Rate (SER / NED), loss, and speed, and automatically expo
 into a formatted Markdown table and CSV file.
 """
 
-from __future__ import annotations
 import argparse
 import csv
-import json
-import os
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -38,7 +34,7 @@ def set_seed(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
 
 
-def compute_levenshtein_distance(seq1: List[int], seq2: List[int]) -> int:
+def compute_levenshtein_distance(seq1: list[int], seq2: list[int]) -> int:
     """Computes standard edit distance between two integer token sequences."""
     n, m = len(seq1), len(seq2)
     dp = [[0] * (m + 1) for _ in range(n + 1)]
@@ -57,7 +53,7 @@ def compute_levenshtein_distance(seq1: List[int], seq2: List[int]) -> int:
     return dp[n][m]
 
 
-def build_samples_and_vocab(dataset_dir: str | Path, feature_cache_dir: str | Path) -> Tuple[List[dict], TokenVocabulary]:
+def build_samples_and_vocab(dataset_dir: str | Path, feature_cache_dir: str | Path) -> tuple[list[dict], TokenVocabulary]:
     """Scans dataset, matches with feature cache, and builds shared vocabulary."""
     dataset_path = Path(dataset_dir)
     cache_path = Path(feature_cache_dir)
@@ -87,18 +83,19 @@ def build_samples_and_vocab(dataset_dir: str | Path, feature_cache_dir: str | Pa
             "feature_path": str(feat_path.resolve()),
         }
 
-        # Transcriptions
+        # Transcriptions: prefer official .lmx if present, fallback to MusicXML
         musicxml_path = img_path.parent / "transcription.musicxml"
         if musicxml_path.exists():
             entry["musicxml_path"] = str(musicxml_path.resolve())
-            tokens = extract_tokens_from_musicxml(musicxml_path)
-            for t in tokens:
-                vocab.add_token(t)
 
         lmx_path = img_path.parent / "transcription.lmx"
         if lmx_path.exists():
             entry["lmx_path"] = str(lmx_path.resolve())
             tokens = lmx_path.read_text(encoding="utf-8").strip().split()
+            for t in tokens:
+                vocab.add_token(t)
+        elif musicxml_path.exists():
+            tokens = extract_tokens_from_musicxml(musicxml_path)
             for t in tokens:
                 vocab.add_token(t)
 
@@ -115,7 +112,7 @@ def train_single_model(
     vocab: TokenVocabulary,
     args: argparse.Namespace,
     device: torch.device,
-) -> Dict[str, Union[float, int, str]]:
+) -> dict[str, float | int | str]:
     """Trains either Run 1 ('zeus') or Run 2 ('musvit') and returns metrics summary."""
     print(f"\n=======================================================")
     print(f" Starting Training: {'Run 1: Zeus Baseline' if model_type == 'zeus' else 'Run 2: MuSViT + Zeus'}")
@@ -141,6 +138,7 @@ def train_single_model(
         encoder_type=model_type,
         vocab_size=len(vocab),
         dim=args.dim,
+        timestep_width=getattr(args, "timestep_width", 16),
         bos_idx=vocab.bos_idx,
         eos_idx=vocab.eos_idx,
         pad_idx=vocab.pad_idx,
@@ -280,7 +278,7 @@ def train_single_model(
     }
 
 
-def export_results_table(results: List[Dict], output_dir: str | Path):
+def export_results_table(results: list[dict], output_dir: str | Path):
     """Formats and writes a comparison table to Markdown, CSV, and stdout."""
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -370,7 +368,8 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-4, help="Initial learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Optimizer weight decay.")
     parser.add_argument("--dim", type=int, default=256, help="Model hidden / embedding dimension.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
+    parser.add_argument("--timestep-width", type=int, default=16, help="Timestep width for Zeus encoder (default: 16 matching solo26).")
+    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate (default: 0.2 matching solo26).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--val-split", type=float, default=0.15, help="Fraction of samples for validation.")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")

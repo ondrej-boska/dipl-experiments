@@ -12,6 +12,7 @@ from .models import (
     ZeusEncoder,
     MusvitEncoder,
     ZeusDecoder,
+    CombinedOMRModel,
     OMRModel,
 )
 
@@ -19,5 +20,7 @@ __all__ = [
     "ZeusEncoder",
     "MusvitEncoder",
     "ZeusDecoder",
+    "CombinedOMRModel",
     "OMRModel",
 ]
+

@@ -10,14 +10,10 @@ Addresses disk size by applying vertical pooling and FP16 half-precision:
 Can be run on the GPU cluster before training to eliminate ViT training overhead.
 """
 
-from __future__ import annotations
 import argparse
-import hashlib
 import json
 import os
-import sys
 from pathlib import Path
-from typing import List, Tuple
 
 import torch
 from PIL import Image
@@ -38,7 +34,7 @@ def get_transform(image_size: int = 1024) -> T.Compose:
     ])
 
 
-def find_staves(dataset_dir: str | Path) -> List[Path]:
+def find_staves(dataset_dir: str | Path) -> list[Path]:
     """Finds all stave images in standard MusiCorpus / OmniOMR layout."""
     base_path = Path(dataset_dir)
     if not base_path.exists():

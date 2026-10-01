@@ -12,3 +12,4 @@ transformers>=4.30.0
 huggingface_hub
 ruff
 ty
+linearized-musicxml @ git+https://github.com/OMR-Research/lmx.git@87fca1c38bda83bc032596ab00af28412f92941d

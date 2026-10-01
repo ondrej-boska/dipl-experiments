@@ -3,9 +3,7 @@ Model architectures for Zeus Baseline (Run 1) and MuSViT + Zeus (Run 2).
 Shared Bahdanau Attention LSTM Decoder ensures 100% identical decoding mechanics.
 """
 
-from __future__ import annotations
-import math
-from typing import Optional, Tuple, Union
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -18,15 +16,15 @@ import torch.nn.functional as F
 
 class BahdanauAttention(nn.Module):
     """
-    Standard additive Bahdanau Attention matching Zeus specification.
+    Standard additive Bahdanau Attention matching Zeus specification (rnn_cells_with_attention.py).
     Computes attention scores over encoder outputs given previous decoder state.
     """
     def __init__(self, encoder_dim: int, decoder_dim: int, attention_dim: int = 256):
         super().__init__()
-        self.encoder_proj = nn.Linear(encoder_dim, attention_dim, bias=False)
+        self.encoder_proj = nn.Linear(encoder_dim, attention_dim, bias=True)
         self.decoder_proj = nn.Linear(decoder_dim * 2, attention_dim, bias=True)  # concatenated (h, c)
-        self.score_proj = nn.Linear(attention_dim, 1, bias=False)
-        self._cached_encoder_proj: Optional[torch.Tensor] = None
+        self.score_proj = nn.Linear(attention_dim, 1, bias=True)
+        self._cached_encoder_proj: torch.Tensor | None = None
 
     def precompute(self, encoder_outputs: torch.Tensor):
         """Precomputes projected encoder representations to avoid recomputation at every token step."""
@@ -38,9 +36,9 @@ class BahdanauAttention(nn.Module):
     def forward(
         self,
         encoder_outputs: torch.Tensor,
-        state: Tuple[torch.Tensor, torch.Tensor],
-        mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        state: tuple[torch.Tensor, torch.Tensor],
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # state: (h, c) each of shape (B, decoder_dim)
         prev_state = torch.cat(state, dim=-1)  # (B, 2 * decoder_dim)
 
@@ -61,8 +59,8 @@ class BahdanauAttention(nn.Module):
 
 class ZeusDecoder(nn.Module):
     """
-    Autoregressive single-layer LSTM decoder with Bahdanau attention.
-    Identical across Run 1 and Run 2 to ensure fair comparison.
+    Autoregressive single-layer LSTM decoder with Bahdanau attention matching Zeus specification.
+    Zeus decoder has no dropout by default; all model dropout is localized in the encoder.
     """
     def __init__(
         self,
@@ -72,7 +70,7 @@ class ZeusDecoder(nn.Module):
         eos_idx: int = 1,
         pad_idx: int = 2,
         max_length: int = 600,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -86,16 +84,16 @@ class ZeusDecoder(nn.Module):
         self.attention = BahdanauAttention(encoder_dim=dim, decoder_dim=dim, attention_dim=dim)
         self.lstm_cell = nn.LSTMCell(input_size=dim * 2, hidden_size=dim)  # input: [embedded_token; context]
         self.fc_out = nn.Linear(dim, vocab_size)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(
         self,
         context: torch.Tensor,
         target_seq: torch.Tensor,
-        context_mask: Optional[torch.Tensor] = None,
+        context_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Teacher-forcing forward pass for training.
+        Teacher-forcing forward pass for training matching Zeus decoder_training.
         Args:
             context: (B, T, dim) encoder output sequence
             target_seq: (B, L) input token IDs (starting with BOS)
@@ -130,8 +128,8 @@ class ZeusDecoder(nn.Module):
     def generate(
         self,
         context: torch.Tensor,
-        max_length: Optional[int] = None,
-        context_mask: Optional[torch.Tensor] = None,
+        max_length: int | None = None,
+        context_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Greedy autoregressive decoding for evaluation / prediction.
@@ -200,10 +198,31 @@ class ResNetConvBlock(nn.Module):
         return out
 
 
+class BiLSTMSumBlock(nn.Module):
+    """
+    Bidirectional LSTM block with merge_mode='sum' and optional residual connection.
+    Replicates the exact sequence modeling in Zeus Keras (keras_model.py:105-111).
+    """
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.2, residual: bool = False):
+        super().__init__()
+        self.lstm = nn.LSTM(in_dim, out_dim, bidirectional=True, batch_first=True)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self.residual = residual
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x)  # (B, T, 2 * out_dim)
+        fwd, bwd = out.chunk(2, dim=-1)
+        summed = self.dropout(fwd + bwd)  # (B, T, out_dim)
+        if self.residual:
+            summed = summed + x
+        return summed
+
+
 class ZeusEncoder(nn.Module):
     """
     Standard Zeus CNN-BiLSTM Encoder (Run 1 Baseline).
     Reduces 2D stave image to 1D horizontal time sequence.
+    Follows solo26 architecture with timestep_width reduction and residual BiLSTM layers.
     """
     def __init__(
         self,
@@ -212,6 +231,7 @@ class ZeusEncoder(nn.Module):
         cnn_ch: int = 32,
         cnn_stages: int = 3,  # 3 stages for single-staff (downsampling = 2^3 = 8)
         input_height: int = 96,
+        timestep_width: int = 16,  # Matches solo26.yaml (16 // 8 = 2x horizontal reduction)
         num_lstm_layers: int = 2,
         dropout: float = 0.2,
     ):
@@ -219,11 +239,18 @@ class ZeusEncoder(nn.Module):
         self.dim = dim
         self.cnn_stages = cnn_stages
         self.input_height = input_height
+        self.timestep_width = timestep_width
 
+        self.remaining = timestep_width // (2 ** cnn_stages)
+        if self.remaining < 1:
+            raise ValueError(
+                f"Inconsistent settings of timestep_width ({timestep_width}) "
+                f"and cnn_stages ({cnn_stages}): timestep_width must be >= {2 ** cnn_stages}"
+            )
+
+        # Initial Conv layer without BatchNorm or ReLU, matching Zeus keras_model.py:45-47
         layers = [
             nn.Conv2d(in_channels, cnn_ch, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(cnn_ch),
-            nn.ReLU(inplace=True),
         ]
 
         curr_ch = cnn_ch
@@ -234,31 +261,38 @@ class ZeusEncoder(nn.Module):
             curr_ch = out_ch
 
         self.conv = nn.Sequential(*layers)
-        self.dropout = nn.Dropout(dropout)
+        self.pre_rnn_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
         reduced_h = input_height // (2 ** cnn_stages)
-        self.rnn_input_size = curr_ch * reduced_h
+        self.rnn_input_size = curr_ch * reduced_h * self.remaining
 
-        # Bidirectional LSTM layers
-        self.lstm = nn.LSTM(
-            input_size=self.rnn_input_size,
-            hidden_size=dim // 2,
-            num_layers=num_lstm_layers,
-            bidirectional=True,
-            batch_first=True,
-            dropout=dropout if num_lstm_layers > 1 else 0.0,
-        )
+        # Bidirectional LSTM layers with merge_mode='sum' and residual connection on layer 1+
+        rnn_layers = []
+        for layer_idx in range(num_lstm_layers):
+            in_d = self.rnn_input_size if layer_idx == 0 else dim
+            rnn_layers.append(
+                BiLSTMSumBlock(in_dim=in_d, out_dim=dim, dropout=dropout, residual=(layer_idx > 0))
+            )
+        self.rnn = nn.Sequential(*rnn_layers)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         # x: (B, 1, H, W)
         feat = self.conv(x)  # (B, C, H', W')
         B, C, H, W = feat.shape
 
-        # Permute to (B, W', H'*C) so the horizontal dimension represents time
+        # Permute to (B, W', H'*C)
         feat = feat.permute(0, 3, 2, 1).contiguous().view(B, W, H * C)
-        feat = self.dropout(feat)
 
-        out, _ = self.lstm(feat)  # (B, W', dim)
+        # Pad horizontal steps if not divisible by remaining
+        if self.remaining > 1:
+            pad_w = (-W) % self.remaining
+            if pad_w > 0:
+                feat = F.pad(feat, (0, 0, 0, pad_w))
+                W = feat.shape[1]
+            feat = feat.reshape(B, W // self.remaining, H * C * self.remaining)
+
+        feat = self.pre_rnn_dropout(feat)
+        out = self.rnn(feat)  # (B, W // remaining, dim)
         return out, None
 
 
@@ -276,7 +310,6 @@ class MusvitEncoder(nn.Module):
         self,
         dim: int = 256,
         musvit_dim: int = 768,
-        num_lstm_layers: int = 1,
         dropout: float = 0.2,
     ):
         super().__init__()
@@ -288,20 +321,14 @@ class MusvitEncoder(nn.Module):
             nn.Linear(musvit_dim, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
         )
 
-        # Contextualizer BiLSTM matching Zeus's sequence modeling capability
-        self.lstm = nn.LSTM(
-            input_size=dim,
-            hidden_size=dim // 2,
-            num_layers=num_lstm_layers,
-            bidirectional=True,
-            batch_first=True,
-        )
+        # Contextualizer BiLSTM matching Zeus's merge_mode='sum' sequence modeling
+        self.lstm = BiLSTMSumBlock(in_dim=dim, out_dim=dim, dropout=dropout, residual=False)
         self.layer_norm = nn.LayerNorm(dim)
 
-    def forward(self, features: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, features: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             features: (B, T, 768) pre-extracted MuSViT features (e.g. T=64 after vertical pooling)
@@ -313,7 +340,7 @@ class MusvitEncoder(nn.Module):
         projected = self.proj(features)
 
         # Sequential contextualization: (B, T, dim) -> (B, T, dim)
-        context, _ = self.lstm(projected)
+        context = self.lstm(projected)
         context = self.layer_norm(context + projected)  # Residual connection
 
         return context, mask
@@ -331,25 +358,27 @@ class CombinedOMRModel(nn.Module):
     """
     def __init__(
         self,
-        encoder_type: str,  # 'zeus' or 'musvit'
+        encoder_type: Literal["zeus", "musvit"],
         vocab_size: int,
         dim: int = 256,
+        timestep_width: int = 16,
         bos_idx: int = 0,
         eos_idx: int = 1,
         pad_idx: int = 2,
         max_length: int = 600,
-        dropout: float = 0.1,
+        dropout: float = 0.2,
     ):
         super().__init__()
         self.encoder_type = encoder_type.lower()
 
         if self.encoder_type == "zeus":
-            self.encoder = ZeusEncoder(dim=dim, dropout=dropout)
+            self.encoder = ZeusEncoder(dim=dim, timestep_width=timestep_width, dropout=dropout)
         elif self.encoder_type == "musvit":
             self.encoder = MusvitEncoder(dim=dim, dropout=dropout)
         else:
             raise ValueError(f"Unknown encoder_type: '{encoder_type}'. Must be 'zeus' or 'musvit'.")
 
+        # In Zeus, all model dropout is localized in the encoder; decoder has 0 dropout
         self.decoder = ZeusDecoder(
             vocab_size=vocab_size,
             dim=dim,
@@ -357,16 +386,20 @@ class CombinedOMRModel(nn.Module):
             eos_idx=eos_idx,
             pad_idx=pad_idx,
             max_length=max_length,
-            dropout=dropout,
+            dropout=0.0,
         )
 
-    def forward(self, x: torch.Tensor, target_seq: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, target_seq: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         context, ctx_mask = self.encoder(x, mask)
         logits = self.decoder(context, target_seq, context_mask=ctx_mask)
         return logits
 
     @torch.inference_mode()
-    def generate(self, x: torch.Tensor, max_length: Optional[int] = None) -> torch.Tensor:
+    def generate(self, x: torch.Tensor, max_length: int | None = None) -> torch.Tensor:
         context, ctx_mask = self.encoder(x)
         preds = self.decoder.generate(context, max_length=max_length, context_mask=ctx_mask)
         return preds
+
+
+# Alias for backward compatibility and flexible importing
+OMRModel = CombinedOMRModel

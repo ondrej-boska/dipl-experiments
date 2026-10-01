@@ -27,9 +27,33 @@ Single musical staves are read **horizontally from left to right**.
 
 ---
 
-## 2. Running on the GPU Cluster
+## 2. Tokenization & LMX Pre-Generation
 
-### Step 1: Pre-Extract Features (Run once on GPU)
+### Why Generate `.lmx` Files?
+By default, if only `transcription.musicxml` is found, the dataset loader uses a simple built-in MusicXML parser. However, generating official **Linearized MusicXML (`.lmx`)** files provides several significant advantages:
+
+1. **100% Token Parity with Official Zeus:** Uses the exact same token grammar (`measure`, `clef:G-2`, `key:0`, `C4`, `quarter`, etc.) and vocabulary specification used by pre-trained Zeus checkpoints.
+2. **Invisible Header Normalization:** Stave crops in MusiCorpus often omit a visible clef or key signature. The LMX compiler resolves and normalizes invisible G-clefs and transposes notes according to the Zeus/MusiCorpus specification.
+3. **Faster Training & I/O:** Pre-tokenized single-line `.lmx` files avoid expensive XML DOM tree parsing during every epoch.
+4. **Interoperability:** Enables direct comparison with official Zeus benchmarks and standard Symbol Error Rate (SER) tools.
+
+### Step 1: Install `linearized-musicxml`
+```bash
+pip install "linearized-musicxml @ git+https://github.com/OMR-Research/lmx.git@87fca1c38bda83bc032596ab00af28412f92941d"
+```
+
+### Step 2: Generate `.lmx` Transcriptions
+Generate `transcription.lmx` beside each `transcription.musicxml` in your dataset:
+```bash
+python -m musvit_zeus_comparison.generate_lmx --dataset-dir OmniOMR.Small
+```
+*(Takes under 5 seconds for OmniOMR.Small. Subsequent training automatically picks up these `.lmx` files).*
+
+---
+
+## 3. Running on the GPU Cluster
+
+### Step 3: Pre-Extract Features (Run once on GPU)
 
 Extract and cache MuSViT embeddings for your dataset:
 
@@ -46,7 +70,7 @@ python -m musvit_zeus_comparison.extract_features \
 
 ---
 
-### Step 2: Run Training and Benchmark Comparison
+### Step 4: Run Training and Benchmark Comparison
 
 To train both **Run 1** and **Run 2** back-to-back under identical settings:
 
@@ -66,7 +90,7 @@ You can also run them individually using `--model zeus` or `--model musvit`.
 
 ---
 
-### Step 3: Inspect the Generated Comparison Table
+### Step 5: Inspect the Generated Comparison Table
 
 Upon completion, a formatted summary table is printed to stdout and saved to:
 - `experiment_results/results_table.md` (Markdown format)
@@ -75,19 +99,20 @@ Upon completion, a formatted summary table is printed to stdout and saved to:
 Example output table:
 
 | Model Run | Encoder | Enc Params | Dec Params | Total Params | Val Loss (best) | Token Acc (%) | SER / NED (%) | Train Time (s) |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Zeus Baseline (Run 1)** | CNN-BiLSTM | 851,200 | 1,185,420 | 2,036,620 | 0.8241 | 82.15% | 18.42% | 145.2s |
 | **MuSViT + Zeus (Run 2)** | MuSViT + Adapter | 394,496 | 1,185,420 | 1,579,916 | 0.5120 | 89.64% | 11.20% | 42.1s |
 
 ---
 
-## 3. Directory Layout
+## 4. Directory Layout
 
 ```
 musvit_zeus_comparison/
 ├── __init__.py          # Package exports
 ├── models.py            # ZeusEncoder, MusvitEncoder, ZeusDecoder, CombinedOMRModel
 ├── dataset.py           # StaveOMRDataset (supports image + feature loading) & StaveCollate
+├── generate_lmx.py      # MusicXML to official LMX transcription generator
 ├── extract_features.py  # Feature extractor with vertical pooling & FP16 compression
 ├── train.py             # Main trainer & evaluator with automated table generation
 └── README.md            # Detailed documentation

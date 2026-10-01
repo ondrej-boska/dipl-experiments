@@ -4,18 +4,14 @@ Supports loading raw images for Run 1 (Zeus) and pre-extracted features for Run 
 Handles token sequence parsing from LMX or MusicXML, vocabulary construction, and batch collation.
 """
 
-from __future__ import annotations
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
-from torchvision import transforms as T
 
 
 # ==============================================================================
@@ -24,15 +20,15 @@ from torchvision import transforms as T
 
 class TokenVocabulary:
     """Manages string token to integer ID mapping."""
-    def __init__(self, special_tokens: Optional[List[str]] = None):
+    def __init__(self, special_tokens: list[str] | None = None):
         self.special_tokens = special_tokens or ["<bos>", "<eos>", "<pad>", "<unk>"]
         self.bos_token = "<bos>"
         self.eos_token = "<eos>"
         self.pad_token = "<pad>"
         self.unk_token = "<unk>"
 
-        self.token2id: Dict[str, int] = {}
-        self.id2token: Dict[int, str] = {}
+        self.token2id: dict[str, int] = {}
+        self.id2token: dict[int, str] = {}
 
         for tok in self.special_tokens:
             self.add_token(tok)
@@ -61,10 +57,10 @@ class TokenVocabulary:
             return idx
         return self.token2id[token]
 
-    def encode(self, tokens: List[str]) -> List[int]:
+    def encode(self, tokens: list[str]) -> list[int]:
         return [self.token2id.get(t, self.unk_idx) for t in tokens]
 
-    def decode(self, ids: List[int]) -> List[str]:
+    def decode(self, ids: list[int]) -> list[str]:
         return [self.id2token.get(i, self.unk_token) for i in ids]
 
     def __len__(self) -> int:
@@ -78,7 +74,7 @@ class TokenVocabulary:
             }, f, indent=2)
 
     @classmethod
-    def load(cls, filepath: str | Path) -> TokenVocabulary:
+    def load(cls, filepath: str | Path) -> "TokenVocabulary":
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
         vocab = cls(special_tokens=data.get("special_tokens"))
@@ -87,7 +83,7 @@ class TokenVocabulary:
         return vocab
 
 
-def extract_tokens_from_musicxml(musicxml_path: Union[str, Path]) -> List[str]:
+def extract_tokens_from_musicxml(musicxml_path: str | Path) -> list[str]:
     """
     Extracts high-level sequential musical tokens from a MusicXML file
     when raw LMX files are not pre-generated.
@@ -146,7 +142,7 @@ class StaveOMRDataset(Dataset):
     """
     def __init__(
         self,
-        samples: List[dict],
+        samples: list[dict],
         vocab: TokenVocabulary,
         mode: str = "zeus",  # 'zeus' or 'musvit'
         image_height: int = 96,  # Zeus single-staff default height
@@ -178,7 +174,7 @@ class StaveOMRDataset(Dataset):
         tensor = torch.from_numpy(resized).float().unsqueeze(0) / 255.0
         return tensor
 
-    def _load_tokens(self, sample: dict) -> List[int]:
+    def _load_tokens(self, sample: dict) -> list[int]:
         # 1. Check for .lmx file
         if "lmx_path" in sample and Path(sample["lmx_path"]).exists():
             lmx_text = Path(sample["lmx_path"]).read_text(encoding="utf-8").strip()
@@ -191,7 +187,7 @@ class StaveOMRDataset(Dataset):
 
         return self.vocab.encode(raw_tokens)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         sample = self.samples[idx]
         tokens = self._load_tokens(sample)
         token_tensor = torch.tensor(tokens, dtype=torch.long)
@@ -224,7 +220,7 @@ class StaveCollate:
         self.bos_idx = bos_idx
         self.eos_idx = eos_idx
 
-    def __call__(self, batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __call__(self, batch: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         inputs, targets = zip(*batch)
 
         # Pad inputs (either 3D images [1, H, W] or 2D feature sequences [T, D])
