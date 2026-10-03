@@ -198,7 +198,7 @@ def extract_and_cache(
 
 def main():
     parser = argparse.ArgumentParser(description="Pre-extract and compress MuSViT features for single staves.")
-    parser.add_argument("--dataset-dir", type=str, default="OmniOMR.Small", help="Path to input dataset.")
+    parser.add_argument("--dataset-dir", type=str, default="UFAL.OmniOMR", help="Path to input dataset (default: UFAL.OmniOMR).")
     parser.add_argument("--output-dir", type=str, default="feature_cache", help="Path to save pre-extracted features.")
     parser.add_argument("--model-name", type=str, default="PRAIG/musvit", help="HuggingFace model ID.")
     parser.add_argument(

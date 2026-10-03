@@ -156,13 +156,19 @@ class ZeusDecoder(nn.Module):
                 logits = self.fc_out(h)  # (B, vocab_size)
                 next_token = torch.argmax(logits, dim=-1)  # (B,)
 
-                preds.append(next_token)
-                is_finished |= (next_token == self.eos_idx)
+                # If sequence was already finished, record pad_idx
+                token_to_record = torch.where(is_finished, torch.full_like(next_token, self.pad_idx), next_token)
+                preds.append(token_to_record)
+
+                is_finished = is_finished | (next_token == self.eos_idx)
                 if is_finished.all():
                     break
-                curr_token = next_token
+                curr_token = torch.where(is_finished, torch.full_like(next_token, self.pad_idx), next_token)
         finally:
             self.attention.clear_cache()
+
+        if not preds:
+            return torch.empty((batch_size, 0), dtype=torch.long, device=context.device)
 
         return torch.stack(preds, dim=1)  # (B, pred_len)
 

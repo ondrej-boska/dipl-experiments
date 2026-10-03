@@ -105,6 +105,62 @@ def build_samples_and_vocab(dataset_dir: str | Path, feature_cache_dir: str | Pa
     return samples, vocab
 
 
+def evaluate_ser(
+    model: nn.Module,
+    val_loader: DataLoader,
+    vocab: TokenVocabulary,
+    max_length: int,
+    device: torch.device,
+) -> tuple[float, float, float, float, int, int]:
+    """
+    Computes Symbol Error Rate (SER) on the validation set using greedy autoregressive generation.
+    Returns:
+        ser: total edit distance / total reference tokens * 100
+        avg_pred_len: average length of predicted token sequences (excluding BOS/EOS/PAD)
+        avg_gold_len: average length of gold token sequences
+        eos_rate: percentage of validation samples that emitted <eos> within max_length
+        total_edit_distance: raw integer edit distance
+        total_ref_tokens: raw integer reference token count
+    """
+    model.eval()
+    total_edit_distance = 0
+    total_ref_tokens = 0
+    total_pred_tokens = 0
+    eos_emitted_count = 0
+    sample_count = 0
+
+    with torch.no_grad():
+        for inputs, _, targets in val_loader:
+            inputs = inputs.to(device)
+            generated = model.generate(inputs, max_length=max_length)
+
+            for pred_seq, gold_seq in zip(generated.cpu().tolist(), targets.cpu().tolist()):
+                sample_count += 1
+                clean_gold = [t for t in gold_seq if t not in (vocab.pad_idx, vocab.eos_idx, vocab.bos_idx)]
+                clean_pred = []
+                hit_eos = False
+                for t in pred_seq:
+                    if t == vocab.eos_idx:
+                        hit_eos = True
+                        break
+                    if t not in (vocab.pad_idx, vocab.bos_idx):
+                        clean_pred.append(t)
+
+                if hit_eos:
+                    eos_emitted_count += 1
+
+                dist = compute_levenshtein_distance(clean_pred, clean_gold)
+                total_edit_distance += dist
+                total_ref_tokens += max(1, len(clean_gold))
+                total_pred_tokens += len(clean_pred)
+
+    ser = (total_edit_distance / max(1, total_ref_tokens)) * 100.0
+    avg_pred_len = total_pred_tokens / max(1, sample_count)
+    avg_gold_len = total_ref_tokens / max(1, sample_count)
+    eos_rate = (eos_emitted_count / max(1, sample_count)) * 100.0
+    return ser, avg_pred_len, avg_gold_len, eos_rate, total_edit_distance, total_ref_tokens
+
+
 def train_single_model(
     model_type: str,
     train_dataset: StaveOMRDataset,
@@ -150,117 +206,216 @@ def train_single_model(
     total_params = enc_params + dec_params
     print(f"Parameters: Encoder: {enc_params:,} | Decoder: {dec_params:,} | Total: {total_params:,}")
 
-    criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.05)
-
+    # Checkpoint resuming
+    start_epoch = 1
     best_val_loss = float("inf")
+    best_ser = float("inf")
+
+    resume_target = None
+    if getattr(args, "resume", None):
+        if str(args.resume).lower() == "auto":
+            # Check latest first, then best
+            for cand in [Path(args.output_dir) / f"{model_type}_latest.pt", Path(args.output_dir) / f"{model_type}_best.pt"]:
+                if cand.exists():
+                    resume_target = cand
+                    break
+        else:
+            cand = Path(args.resume)
+            if cand.exists():
+                resume_target = cand
+
+    if resume_target is not None:
+        print(f"Loading checkpoint from: {resume_target}")
+        checkpoint = torch.load(resume_target, map_location=device)
+        state_dict = checkpoint.get("model", checkpoint)
+        model.load_state_dict(state_dict)
+        if isinstance(checkpoint, dict):
+            start_epoch = checkpoint.get("epoch", 0) + 1
+            best_val_loss = checkpoint.get("val_loss", float("inf"))
+            best_ser = checkpoint.get("ser", float("inf"))
+        print(f"Resumed successfully. Training will continue from epoch {start_epoch:02d}/{args.epochs:02d}.")
+
+    # Fast evaluation-only mode if requested
+    if getattr(args, "eval_only", False):
+        print(f"\nRunning standalone validation SER evaluation for {model_type}...")
+        ser, avg_pred, avg_gold, eos_pct, total_edit, total_ref = evaluate_ser(
+            model, val_loader, vocab, max_length=args.max_gen_length, device=device
+        )
+        print(
+            f"Validation SER: {ser:.2f}% "
+            f"(Edit Dist: {total_edit:,} / {total_ref:,} tokens | "
+            f"Avg Pred Len: {avg_pred:.1f} vs Gold: {avg_gold:.1f} | "
+            f"EOS Rate: {eos_pct:.1f}%)"
+        )
+        return {
+            "model": "Zeus Baseline (Run 1)" if model_type == "zeus" else "MuSViT + Zeus (Run 2)",
+            "encoder": "CNN-BiLSTM" if model_type == "zeus" else "MuSViT + Adapter",
+            "enc_params": enc_params,
+            "dec_params": dec_params,
+            "total_params": total_params,
+            "train_loss": 0.0,
+            "val_loss": round(best_val_loss, 4),
+            "token_acc": 0.0,
+            "ser": round(ser, 2),
+            "total_time_sec": 0.0,
+            "avg_epoch_sec": 0.0,
+            "history": [],
+        }
+
+    criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
+
+    # Optimizer matching TensorFlow Zeus specification
+    opt_name = getattr(args, "optimizer", "adam").lower()
+    if opt_name == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-7)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Cosine annealing learning rate schedule matching Zeus's CosineDecay
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+    for _ in range(1, start_epoch):
+        scheduler.step()
+
     start_time = time.time()
     history = []
+    output_dir = Path(args.output_dir)
+    snapshots_dir = output_dir / "snapshots"
+    if getattr(args, "save_snapshots", False):
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
-        model.train()
-        train_loss = 0.0
-        train_tokens = 0
+    if start_epoch > args.epochs:
+        print(f"Model already reached epoch {start_epoch - 1} >= requested target epochs {args.epochs}. Skipping training loop.")
+    else:
+        for epoch in range(start_epoch, args.epochs + 1):
+            epoch_start = time.time()
+            model.train()
+            train_loss = 0.0
+            train_tokens = 0
 
-        for inputs, input_seqs, targets in train_loader:
-            inputs = inputs.to(device)
-            input_seqs = input_seqs.to(device)
-            targets = targets.to(device)
-
-            optimizer.zero_grad()
-            logits = model(inputs, input_seqs)  # (B, L, V)
-
-            loss = criterion(logits.view(-1, len(vocab)), targets.view(-1))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            train_loss += loss.item() * targets.size(0)
-            train_tokens += (targets != vocab.pad_idx).sum().item()
-
-        scheduler.step()
-        train_loss /= len(train_dataset)
-
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            for inputs, input_seqs, targets in val_loader:
+            for inputs, input_seqs, targets in train_loader:
                 inputs = inputs.to(device)
                 input_seqs = input_seqs.to(device)
                 targets = targets.to(device)
 
-                logits = model(inputs, input_seqs)
+                optimizer.zero_grad()
+                logits = model(inputs, input_seqs)  # (B, L, V)
+
                 loss = criterion(logits.view(-1, len(vocab)), targets.view(-1))
-                val_loss += loss.item() * targets.size(0)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-                preds = torch.argmax(logits, dim=-1)
-                mask = (targets != vocab.pad_idx)
-                val_correct += ((preds == targets) & mask).sum().item()
-                val_total += mask.sum().item()
+                train_loss += loss.item() * targets.size(0)
+                train_tokens += (targets != vocab.pad_idx).sum().item()
 
-        val_loss /= len(val_dataset)
-        token_acc = (val_correct / max(1, val_total)) * 100.0
-        epoch_sec = time.time() - epoch_start
+            scheduler.step()
+            train_loss /= len(train_dataset)
 
-        history.append({
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "token_acc": token_acc,
-            "sec": epoch_sec,
-        })
+            # Validation phase (teacher-forcing token accuracy & loss)
+            model.eval()
+            val_loss = 0.0
+            val_correct = 0
+            val_total = 0
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            # Save checkpoint
-            ckpt_path = Path(args.output_dir) / f"{model_type}_best.pt"
-            torch.save({"model": model.state_dict(), "epoch": epoch, "vocab": vocab.token2id}, ckpt_path)
+            with torch.no_grad():
+                for inputs, input_seqs, targets in val_loader:
+                    inputs = inputs.to(device)
+                    input_seqs = input_seqs.to(device)
+                    targets = targets.to(device)
 
-        if epoch % max(1, args.log_interval) == 0 or epoch == args.epochs:
-            print(
-                f"Epoch {epoch:02d}/{args.epochs:02d} | "
-                f"Train Loss: {train_loss:.4f} | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Token Acc: {token_acc:.2f}% | "
-                f"Time: {epoch_sec:.1f}s"
+                    logits = model(inputs, input_seqs)
+                    loss = criterion(logits.view(-1, len(vocab)), targets.view(-1))
+                    val_loss += loss.item() * targets.size(0)
+
+                    preds = torch.argmax(logits, dim=-1)
+                    mask = (targets != vocab.pad_idx)
+                    val_correct += ((preds == targets) & mask).sum().item()
+                    val_total += mask.sum().item()
+
+            val_loss /= len(val_dataset)
+            token_acc = (val_correct / max(1, val_total)) * 100.0
+            epoch_sec = time.time() - epoch_start
+
+            # Periodic Symbol Error Rate (SER) evaluation matching Zeus
+            eval_interval = getattr(args, "eval_interval", 10)
+            should_eval_ser = (eval_interval > 0 and (epoch % eval_interval == 0 or epoch == args.epochs))
+
+            current_ser = None
+            if should_eval_ser:
+                ser, avg_pred, avg_gold, eos_pct, total_edit, total_ref = evaluate_ser(
+                    model, val_loader, vocab, max_length=args.max_gen_length, device=device
+                )
+                current_ser = ser
+                if ser < best_ser:
+                    best_ser = ser
+                    # Save best SER checkpoint
+                    torch.save(
+                        {"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "ser": ser, "vocab": vocab.token2id},
+                        output_dir / f"{model_type}_best.pt",
+                    )
+
+            # Update best validation loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                if not should_eval_ser:
+                    torch.save(
+                        {"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "ser": best_ser, "vocab": vocab.token2id},
+                        output_dir / f"{model_type}_best.pt",
+                    )
+
+            # Always save latest checkpoint for resume safety
+            torch.save(
+                {"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "ser": current_ser or best_ser, "vocab": vocab.token2id},
+                output_dir / f"{model_type}_latest.pt",
             )
+
+            if getattr(args, "save_snapshots", False) and should_eval_ser:
+                torch.save(
+                    {"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "ser": current_ser, "vocab": vocab.token2id},
+                    snapshots_dir / f"{model_type}_epoch_{epoch:03d}.pt",
+                )
+
+            history.append({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "token_acc": token_acc,
+                "ser": current_ser,
+                "sec": epoch_sec,
+            })
+
+            if epoch % max(1, args.log_interval) == 0 or epoch == args.epochs:
+                ser_str = f" | Val SER: {current_ser:.2f}% (EOS: {eos_pct:.1f}%)" if current_ser is not None else ""
+                print(
+                    f"Epoch {epoch:02d}/{args.epochs:02d} | "
+                    f"Train Loss: {train_loss:.4f} | "
+                    f"Val Loss: {val_loss:.4f} | "
+                    f"Token Acc: {token_acc:.2f}%"
+                    f"{ser_str} | "
+                    f"Time: {epoch_sec:.1f}s"
+                )
 
     total_training_time = time.time() - start_time
 
-    # Final Symbol Error Rate (SER / NED) evaluation on validation set using greedy generation
-    print(f"\nComputing Final Symbol Error Rate (SER) for {model_type}...")
-    model.eval()
-    total_edit_distance = 0
-    total_ref_tokens = 0
+    # Final Symbol Error Rate (SER) computation if not computed in the final epoch
+    if best_ser == float("inf"):
+        print(f"\nComputing Final Symbol Error Rate (SER) for {model_type}...")
+        ser, avg_pred, avg_gold, eos_pct, total_edit, total_ref = evaluate_ser(
+            model, val_loader, vocab, max_length=args.max_gen_length, device=device
+        )
+        best_ser = ser
+        print(
+            f"Final Validation SER: {ser:.2f}% "
+            f"(Total Edit Distance: {total_edit:,} / {total_ref:,} tokens | "
+            f"Avg Pred Len: {avg_pred:.1f} vs Gold: {avg_gold:.1f} | "
+            f"EOS Rate: {eos_pct:.1f}%)"
+        )
+    else:
+        print(f"\nBest Validation SER achieved during run: {best_ser:.2f}%")
 
-    with torch.no_grad():
-        for inputs, _, targets in val_loader:
-            inputs = inputs.to(device)
-            # Greedy autoregressive generation
-            generated = model.generate(inputs, max_length=args.max_gen_length)
-
-            for pred_seq, gold_seq in zip(generated.cpu().tolist(), targets.cpu().tolist()):
-                # Filter out BOS, EOS, PAD
-                clean_gold = [t for t in gold_seq if t not in (vocab.pad_idx, vocab.eos_idx, vocab.bos_idx)]
-                clean_pred = []
-                for t in pred_seq:
-                    if t == vocab.eos_idx:
-                        break
-                    if t not in (vocab.pad_idx, vocab.bos_idx):
-                        clean_pred.append(t)
-
-                dist = compute_levenshtein_distance(clean_pred, clean_gold)
-                total_edit_distance += dist
-                total_ref_tokens += max(1, len(clean_gold))
-
-    ser = (total_edit_distance / max(1, total_ref_tokens)) * 100.0
-    print(f"Final Validation SER: {ser:.2f}% (Total Edit Distance: {total_edit_distance} / {total_ref_tokens} tokens)")
+    final_train_loss = history[-1]["train_loss"] if history else 0.0
+    final_token_acc = history[-1]["token_acc"] if history else 0.0
+    elapsed_epochs = max(1, len(history))
 
     return {
         "model": "Zeus Baseline (Run 1)" if model_type == "zeus" else "MuSViT + Zeus (Run 2)",
@@ -268,12 +423,12 @@ def train_single_model(
         "enc_params": enc_params,
         "dec_params": dec_params,
         "total_params": total_params,
-        "train_loss": round(history[-1]["train_loss"], 4),
+        "train_loss": round(final_train_loss, 4),
         "val_loss": round(best_val_loss, 4),
-        "token_acc": round(history[-1]["token_acc"], 2),
-        "ser": round(ser, 2),
+        "token_acc": round(final_token_acc, 2),
+        "ser": round(best_ser, 2),
         "total_time_sec": round(total_training_time, 1),
-        "avg_epoch_sec": round(total_training_time / max(1, args.epochs), 2),
+        "avg_epoch_sec": round(total_training_time / elapsed_epochs, 2),
         "history": history,
     }
 
@@ -360,20 +515,25 @@ def main():
         choices=["zeus", "musvit", "compare"],
         help="Select 'zeus' (Run 1), 'musvit' (Run 2), or 'compare' (runs both consecutively).",
     )
-    parser.add_argument("--dataset-dir", type=str, default="OmniOMR.Small", help="Dataset directory.")
+    parser.add_argument("--dataset-dir", type=str, default="UFAL.OmniOMR", help="Dataset directory (default: UFAL.OmniOMR).")
     parser.add_argument("--feature-cache-dir", type=str, default="feature_cache", help="Directory of pre-extracted MuSViT features.")
     parser.add_argument("--output-dir", type=str, default="experiment_results", help="Directory to save logs, checkpoints and tables.")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=16, help="Training batch size.")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Initial learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Optimizer weight decay.")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs (Zeus trains 400-500 from scratch).")
+    parser.add_argument("--batch-size", type=int, default=32, help="Training batch size (Zeus uses 32 or 64).")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate (Zeus default: 1e-3).")
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw"], help="Optimizer type ('adam' matching Zeus, or 'adamw').")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Optimizer weight decay (used only if optimizer is adamw).")
     parser.add_argument("--dim", type=int, default=256, help="Model hidden / embedding dimension.")
     parser.add_argument("--timestep-width", type=int, default=16, help="Timestep width for Zeus encoder (default: 16 matching solo26).")
     parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate (default: 0.2 matching solo26).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--val-split", type=float, default=0.15, help="Fraction of samples for validation.")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
-    parser.add_argument("--log-interval", type=int, default=1, help="Epoch print interval.")
+    parser.add_argument("--log-interval", type=int, default=1, help="Epoch loss print interval.")
+    parser.add_argument("--eval-interval", type=int, default=10, help="Interval (epochs) to evaluate validation SER (matches Zeus --evaluation-each 10).")
+    parser.add_argument("--resume", type=str, default=None, help="Resume training. Pass 'auto' to auto-detect best/latest checkpoint, or path to .pt checkpoint.")
+    parser.add_argument("--save-snapshots", action="store_true", help="Save intermediate snapshot .pt checkpoints for evaluated epochs (matching Zeus).")
+    parser.add_argument("--eval-only", action="store_true", help="Skip training and only compute validation SER on loaded/existing checkpoint.")
     parser.add_argument("--max-gen-length", type=int, default=300, help="Max length for autoregressive evaluation.")
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda' or 'cpu'). Auto-detected if not specified.")
 
@@ -388,7 +548,11 @@ def main():
     # 1. Discover samples and build shared vocabulary
     samples, vocab = build_samples_and_vocab(args.dataset_dir, args.feature_cache_dir)
     vocab_path = Path(args.output_dir) / "vocab.json"
-    vocab.save(vocab_path)
+    if args.resume and vocab_path.exists():
+        print(f"Loading existing vocabulary from {vocab_path} to preserve exact checkpoint token mapping...")
+        vocab = TokenVocabulary.load(vocab_path)
+    else:
+        vocab.save(vocab_path)
 
     # 2. Partition identical train/val sample subsets
     total_samples = len(samples)

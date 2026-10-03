@@ -45,9 +45,10 @@ pip install "linearized-musicxml @ git+https://github.com/OMR-Research/lmx.git@8
 ### Step 2: Generate `.lmx` Transcriptions
 Generate `transcription.lmx` beside each `transcription.musicxml` in your dataset:
 ```bash
-python -m musvit_zeus_comparison.generate_lmx --dataset-dir OmniOMR.Small
+python -m musvit_zeus_comparison.generate_lmx
+# Defaults to --dataset-dir UFAL.OmniOMR
 ```
-*(Takes under 5 seconds for OmniOMR.Small. Subsequent training automatically picks up these `.lmx` files).*
+*(Takes under 15 seconds for ~1,200 staves. Subsequent training automatically picks up these `.lmx` files).*
 
 ---
 
@@ -59,7 +60,7 @@ Extract and cache MuSViT embeddings for your dataset:
 
 ```bash
 python -m musvit_zeus_comparison.extract_features \
-    --dataset-dir OmniOMR.Small \
+    --dataset-dir UFAL.OmniOMR \
     --output-dir feature_cache \
     --pool-mode vertical_mean \
     --precision float16 \
@@ -72,21 +73,47 @@ python -m musvit_zeus_comparison.extract_features \
 
 ### Step 4: Run Training and Benchmark Comparison
 
-To train both **Run 1** and **Run 2** back-to-back under identical settings:
+In the official TensorFlow Zeus implementation (`docs/training-zeus.md`), models are trained from scratch for **400 to 500 epochs** (`--epochs 500`, `--learning-rate 1e-3`, `--lr-decay cos`, `--batch-size 32/64`).
 
+#### Train from Scratch (Zeus Hyperparameters)
 ```bash
 python -m musvit_zeus_comparison.train \
     --model compare \
-    --dataset-dir OmniOMR.Small \
+    --dataset-dir UFAL.OmniOMR \
     --feature-cache-dir feature_cache \
     --output-dir experiment_results \
-    --epochs 20 \
-    --batch-size 16 \
-    --lr 5e-4 \
+    --epochs 200 \
+    --batch-size 32 \
+    --lr 1e-3 \
+    --optimizer adam \
+    --eval-interval 20 \
     --device cuda
 ```
 
-You can also run them individually using `--model zeus` or `--model musvit`.
+#### Running via SLURM on the Cluster
+Submit as a background batch job (automatically allocates 1 GPU, 4 CPUs, 24G RAM on `-p gpu`):
+```bash
+sbatch run_comparison.slurm
+```
+To monitor progress in real-time:
+```bash
+tail -f logs/slurm-musvit-zeus-comp-*.out
+```
+
+Or run interactively inside your allocation:
+```bash
+srun -p gpu -G1 -c4 --mem=24G bash run_comparison.slurm
+```
+
+#### Fast Evaluation Only (Check Current Model Performance)
+To evaluate the latest or best saved checkpoints without training:
+```bash
+python -m musvit_zeus_comparison.train \
+    --model compare \
+    --resume auto \
+    --eval-only \
+    --device cuda
+```
 
 ---
 
