@@ -8,7 +8,9 @@ into a formatted Markdown table and CSV file.
 
 import argparse
 import csv
+import json
 import random
+import re
 import time
 from pathlib import Path
 
@@ -53,6 +55,115 @@ def compute_levenshtein_distance(seq1: list[int], seq2: list[int]) -> int:
     return dp[n][m]
 
 
+def _index_feature_cache(cache_path: Path) -> dict[str, Path]:
+    """
+    Builds a fast in-memory index mapping sample identifiers to feature file paths in cache.
+    Handles manifest lookups, exact filenames, stripped suffixes, and canonical MusiCorpus stave keys.
+    """
+    cache_index: dict[str, Path] = {}
+    if not cache_path.exists():
+        return cache_index
+
+    # 1. Manifest index if manifest.json exists
+    manifest_file = cache_path / "manifest.json"
+    if manifest_file.exists():
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+            for entry in manifest_data:
+                feat_p = Path(entry.get("feature_path", ""))
+                if feat_p.exists():
+                    if "image_path" in entry:
+                        cache_index[str(Path(entry["image_path"]).resolve())] = feat_p
+                    if "relative_path" in entry:
+                        r_str = str(entry["relative_path"]).replace("\\", "_").replace("/", "_").replace(".jpg", "").replace(".png", "")
+                        cache_index[r_str] = feat_p
+        except Exception:
+            pass
+
+    # 2. Scan all .pt files in cache directory
+    for pt_file in cache_path.glob("*.pt"):
+        stem = pt_file.stem
+        cache_index[pt_file.name] = pt_file
+        cache_index[stem] = pt_file
+
+        # Strip standard pooling and precision suffixes (e.g. _vertical_mean_float16)
+        base_key = re.sub(r"_(vertical_mean|vertical_4slice|full)_(float16|float32)$", "", stem)
+        cache_index[base_key] = pt_file
+
+        # Index canonical MusiCorpus stave suffix (<piece_id>_Staves_<stave_id>_<stem>)
+        # even if prefixed with dataset folders (e.g. 'OmniOMR_<piece>_Staves_<stave>_image')
+        if "_Staves_" in base_key:
+            parts = base_key.split("_Staves_")
+            stave_after = parts[1]  # e.g. '10_image'
+            piece_part = parts[0]
+            cache_index[f"{piece_part}_Staves_{stave_after}"] = pt_file
+
+            piece_tokens = piece_part.split("_")
+            for i in range(1, len(piece_tokens)):
+                stripped_piece = "_".join(piece_tokens[i:])
+                cache_index[f"{stripped_piece}_Staves_{stave_after}"] = pt_file
+
+    return cache_index
+
+
+def find_feature_path(
+    img_path: Path,
+    dataset_path: Path,
+    cache_path: Path,
+    cache_index: dict[str, Path],
+) -> Path:
+    """
+    Robustly resolves the pre-extracted feature file for an image.
+    Supports single-dataset root, multi-dataset root (e.g. 'datasets/<subdataset>/...'),
+    and arbitrary directory layouts.
+    """
+    # 1. Manifest lookup by absolute image path
+    resolved_img_str = str(img_path.resolve())
+    if resolved_img_str in cache_index:
+        return cache_index[resolved_img_str]
+
+    # 2. Canonical MusiCorpus stave key: <piece_id>_Staves_<stave_id>_<stem>
+    if "Staves" in img_path.parts:
+        parts = img_path.parts
+        staves_idx = parts.index("Staves")
+        if staves_idx > 0 and staves_idx + 1 < len(parts):
+            piece_id = parts[staves_idx - 1]
+            stave_id = parts[staves_idx + 1]
+            stave_key = f"{piece_id}_Staves_{stave_id}_{img_path.stem}"
+
+            if stave_key in cache_index:
+                return cache_index[stave_key]
+
+            cand = cache_path / f"{stave_key}_vertical_mean_float16.pt"
+            if cand.is_file():
+                return cand
+
+    # 3. Exact relative path from dataset_dir
+    rel_path = img_path.relative_to(dataset_path) if dataset_path in img_path.parents else Path(img_path.name)
+    rel_str = str(rel_path).replace("\\", "_").replace("/", "_").replace(img_path.suffix, "")
+
+    if rel_str in cache_index:
+        return cache_index[rel_str]
+
+    cand = cache_path / f"{rel_str}_vertical_mean_float16.pt"
+    if cand.is_file():
+        return cand
+
+    # 4. If dataset_dir points to parent (e.g. 'datasets/'), strip top dataset folder
+    if len(rel_path.parts) > 1:
+        sub_rel = Path(*rel_path.parts[1:])
+        sub_rel_str = str(sub_rel).replace("\\", "_").replace("/", "_").replace(img_path.suffix, "")
+        if sub_rel_str in cache_index:
+            return cache_index[sub_rel_str]
+        cand = cache_path / f"{sub_rel_str}_vertical_mean_float16.pt"
+        if cand.is_file():
+            return cand
+
+    # 5. Fallback path
+    return cache_path / f"{rel_str}_vertical_mean_float16.pt"
+
+
 def build_samples_and_vocab(dataset_dir: str | Path, feature_cache_dir: str | Path) -> tuple[list[dict], TokenVocabulary]:
     """Scans dataset, matches with feature cache, and builds shared vocabulary."""
     dataset_path = Path(dataset_dir)
@@ -60,47 +171,75 @@ def build_samples_and_vocab(dataset_dir: str | Path, feature_cache_dir: str | Pa
 
     staves = sorted(list(dataset_path.glob("*/Staves/*/image.jpg")))
     if not staves:
+        staves = sorted(list(dataset_path.glob("*/*/Staves/*/image.jpg")))
+    if not staves:
         staves = sorted(list(dataset_path.rglob("Staves/*/image.jpg")))
     if not staves:
         staves = sorted(list(dataset_path.rglob("*.jpg")) + list(dataset_path.rglob("*.png")))
 
+    cache_index = _index_feature_cache(cache_path)
+
+    # Detect if LMX transcriptions are present in the dataset
+    has_any_lmx = any((p.parent / "transcription.lmx").is_file() for p in staves[:min(len(staves), 500)])
+    if not has_any_lmx:
+        has_any_lmx = any((p.parent / "transcription.lmx").is_file() for p in staves)
+
     samples = []
     vocab = TokenVocabulary()
+    matched_features = 0
+    skipped_incompatible = 0
 
-    print(f"Discovered {len(staves)} stave samples. Building vocabulary...")
+    print(f"Discovered {len(staves)} stave samples. Indexing features and building vocabulary...")
     for img_path in staves:
-        rel_path = img_path.relative_to(dataset_path) if dataset_path in img_path.parents else img_path.name
-        rel_str = str(rel_path).replace("\\", "_").replace("/", "_").replace(".jpg", "").replace(".png", "")
+        lmx_path = img_path.parent / "transcription.lmx"
+        musicxml_path = img_path.parent / "transcription.musicxml"
 
-        # Look for matching feature file in cache (check common naming patterns)
-        feat_path = cache_path / f"{rel_str}_vertical_mean_float16.pt"
-        if not feat_path.exists():
-            matches = list(cache_path.glob(f"{rel_str}*.pt"))
-            feat_path = matches[0] if matches else feat_path
+        # When LMX generation has been run, strictly require valid .lmx and skip unconvertible/errored staves
+        if has_any_lmx:
+            if not lmx_path.is_file() or lmx_path.stat().st_size == 0:
+                skipped_incompatible += 1
+                continue
+            lmx_text = lmx_path.read_text(encoding="utf-8").strip()
+            tokens = lmx_text.split()
+            if not tokens:
+                skipped_incompatible += 1
+                continue
+        else:
+            # Fallback only for datasets where LMX generation was not run
+            if lmx_path.is_file() and lmx_path.stat().st_size > 0:
+                tokens = lmx_path.read_text(encoding="utf-8").strip().split()
+            elif musicxml_path.is_file():
+                tokens = extract_tokens_from_musicxml(musicxml_path)
+            else:
+                tokens = []
+            if not tokens:
+                skipped_incompatible += 1
+                continue
+
+        feat_path = find_feature_path(img_path, dataset_path, cache_path, cache_index)
+        if feat_path.is_file():
+            matched_features += 1
 
         entry = {
             "image_path": str(img_path.resolve()),
             "feature_path": str(feat_path.resolve()),
         }
-
-        # Transcriptions: prefer official .lmx if present, fallback to MusicXML
-        musicxml_path = img_path.parent / "transcription.musicxml"
-        if musicxml_path.exists():
+        if lmx_path.is_file():
+            entry["lmx_path"] = str(lmx_path.resolve())
+        if musicxml_path.is_file():
             entry["musicxml_path"] = str(musicxml_path.resolve())
 
-        lmx_path = img_path.parent / "transcription.lmx"
-        if lmx_path.exists():
-            entry["lmx_path"] = str(lmx_path.resolve())
-            tokens = lmx_path.read_text(encoding="utf-8").strip().split()
-            for t in tokens:
-                vocab.add_token(t)
-        elif musicxml_path.exists():
-            tokens = extract_tokens_from_musicxml(musicxml_path)
-            for t in tokens:
-                vocab.add_token(t)
+        for t in tokens:
+            vocab.add_token(t)
 
         samples.append(entry)
 
+    if skipped_incompatible > 0:
+        print(f"LMX Consistency Filter: Skipped {skipped_incompatible} incompatible / errored samples without valid .lmx files.")
+    print(f"Retained {len(samples)} valid samples for training and validation.")
+    print(f"Feature Cache: matched {matched_features}/{len(samples)} samples to pre-extracted features in '{cache_path}'.")
+    if matched_features < len(samples):
+        print(f"  (Note: {len(samples) - matched_features} samples without features. Run 1 'zeus' will still work; Run 2 'musvit' requires extract_features.py).")
     print(f"Vocabulary initialized with {len(vocab)} unique tokens.")
     return samples, vocab
 
@@ -173,6 +312,21 @@ def train_single_model(
     print(f"\n=======================================================")
     print(f" Starting Training: {'Run 1: Zeus Baseline' if model_type == 'zeus' else 'Run 2: MuSViT + Zeus'}")
     print(f"=======================================================")
+
+    # Verify MuSViT pre-extracted features exist before training
+    if model_type == "musvit":
+        missing_train = [s for s in train_dataset.samples if not Path(s.get("feature_path", "")).is_file()]
+        missing_val = [s for s in val_dataset.samples if not Path(s.get("feature_path", "")).is_file()]
+        total_missing = len(missing_train) + len(missing_val)
+        if total_missing > 0:
+            example_missing = (missing_train[0] if missing_train else missing_val[0]).get("feature_path", "N/A")
+            raise FileNotFoundError(
+                f"\n[Error] MuSViT training requires pre-extracted feature files in '{args.feature_cache_dir}'.\n"
+                f"Missing feature files for {len(missing_train)}/{len(train_dataset)} training samples "
+                f"and {len(missing_val)}/{len(val_dataset)} validation samples.\n"
+                f"Example missing target: {example_missing}\n"
+                f"Please run 'python -m musvit_zeus_comparison.extract_features' to extract features before training MuSViT."
+            )
 
     collate_fn = StaveCollate(pad_idx=vocab.pad_idx, bos_idx=vocab.bos_idx, eos_idx=vocab.eos_idx)
     train_loader = DataLoader(

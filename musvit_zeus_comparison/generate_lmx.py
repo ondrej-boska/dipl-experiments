@@ -84,6 +84,8 @@ def generate_lmx_dataset(
     # Find all transcription.musicxml files
     xml_files = sorted(list(base_path.glob("*/Staves/*/transcription.musicxml")))
     if not xml_files:
+        xml_files = sorted(list(base_path.glob("*/*/Staves/*/transcription.musicxml")))
+    if not xml_files:
         xml_files = sorted(list(base_path.rglob("transcription.musicxml")))
     if not xml_files:
         xml_files = sorted(list(base_path.rglob("*.musicxml")))

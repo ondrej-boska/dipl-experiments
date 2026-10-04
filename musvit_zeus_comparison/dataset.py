@@ -194,13 +194,15 @@ class StaveOMRDataset(Dataset):
 
         if self.mode == "musvit":
             feat_path = Path(sample.get("feature_path", ""))
-            if feat_path.exists():
+            if feat_path.is_file():
                 feat = torch.load(feat_path, map_location="cpu", weights_only=True)
                 # Convert to float32 for training stability
                 return feat.float(), token_tensor
             else:
-                # If feature is missing, return a dummy placeholder tensor
-                return torch.zeros((64, 768), dtype=torch.float32), token_tensor
+                raise FileNotFoundError(
+                    f"Pre-extracted MuSViT feature file not found for sample: '{sample.get('image_path')}'. "
+                    f"Looked at: '{feat_path}'. Please run extract_features.py before training MuSViT."
+                )
 
         else:
             # Mode 'zeus': load normalized 2D image

@@ -42,6 +42,8 @@ def find_staves(dataset_dir: str | Path) -> list[Path]:
 
     staves = sorted(list(base_path.glob("*/Staves/*/image.jpg")))
     if not staves:
+        staves = sorted(list(base_path.glob("*/*/Staves/*/image.jpg")))
+    if not staves:
         staves = sorted(list(base_path.rglob("Staves/*/image.jpg")))
     if not staves:
         # Generic fallback for any jpg/png images
@@ -157,14 +159,27 @@ def extract_and_cache(
             manifest_entry["musicxml_path"] = str(musicxml_path.resolve())
 
         lmx_path = img_path.parent / "transcription.lmx"
-        if lmx_path.exists():
-            manifest_entry["lmx_path"] = str(lmx_path.resolve())
+        # Check if already cached under direct path or canonical stave key
+        existing_feat = None
+        if skip_existing:
+            if feat_path.is_file():
+                existing_feat = feat_path
+            elif "Staves" in img_path.parts:
+                parts = img_path.parts
+                staves_idx = parts.index("Staves")
+                if staves_idx > 0 and staves_idx + 1 < len(parts):
+                    stave_key = f"{parts[staves_idx - 1]}_Staves_{parts[staves_idx + 1]}_{img_path.stem}"
+                    cand = output_path / f"{stave_key}_{pool_mode}_{precision}.pt"
+                    if cand.is_file():
+                        existing_feat = cand
 
-        manifest.append(manifest_entry)
-
-        if skip_existing and feat_path.exists():
+        if existing_feat is not None:
+            manifest_entry["feature_path"] = str(existing_feat.resolve())
+            manifest.append(manifest_entry)
             skipped_count += 1
             continue
+
+        manifest.append(manifest_entry)
 
         try:
             image = Image.open(img_path).convert("RGB")
