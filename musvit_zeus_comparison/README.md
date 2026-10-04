@@ -4,96 +4,110 @@ This module provides a reproducible, controlled experiment comparing:
 - **Run 1 (Zeus Baseline):** CNN-BiLSTM Encoder + Zeus Bahdanau Attention LSTM Decoder (trained from scratch).
 - **Run 2 (MuSViT + Zeus):** Pre-trained MuSViT Vision Transformer Feature Extractor + Zeus Bahdanau Attention LSTM Decoder.
 
-Both runs share the **exact same decoder architecture, random seed, training/validation splits, learning rate schedule, optimizer, and loss function**.
+Both runs share the **exact same decoder architecture, random seed, training/validation/test splits, learning rate schedule, optimizer, and evaluation metrics**.
 
 ---
 
-## 1. Feature Pre-Extraction & Storage Optimization
+## 1. Unified Zeus Workflow
 
-### The Problem
-Raw patch embeddings from ViT models on large images ($1024 \times 1024$) generate $4096$ patch tokens of dimension $768$:
-- **Full uncompressed FP32:** $4096 \times 768 \times 4 \text{ bytes} \approx \mathbf{12.6\text{ MB}}$ per stave image.
-- For $10,000$ staves: **$\approx 126\text{ GB}$**. This would quickly saturate disk space and cause heavy I/O bottlenecks.
+The workflow strictly follows the reference Zeus repository implementation:
 
-### The Solution: Vertical 1D Pooling in FP16
-Single musical staves are read **horizontally from left to right**. 
-`extract_features.py` averages over the 64 vertical rows ($64 \times 64$ patch grid) and saves in `float16`:
-- **Sequence shape:** `(64, 768)`
-- **Storage per stave:** $64 \times 768 \times 2 \text{ bytes} = \mathbf{98.3\text{ KB}}$ (**128x smaller!**)
-- **Storage for 420 staves (OmniOMR.Small):** **$\approx 41\text{ MB}$**
-- **Storage for 10,000 staves:** **$\approx 980\text{ MB}$ (under 1 GB)**
-
-*(Alternative: `--pool-mode vertical_4slice` preserves 4 vertical height bins $\to$ `[256, 768]`, taking ~393 KB/sample).*
-
----
-
-## 2. Tokenization & LMX Pre-Generation
-
-### Why Generate `.lmx` Files?
-By default, if only `transcription.musicxml` is found, the dataset loader uses a simple built-in MusicXML parser. However, generating official **Linearized MusicXML (`.lmx`)** files provides several significant advantages:
-
-1. **100% Token Parity with Official Zeus:** Uses the exact same token grammar (`measure`, `clef:G-2`, `key:0`, `C4`, `quarter`, etc.) and vocabulary specification used by pre-trained Zeus checkpoints.
-2. **Invisible Header Normalization:** Stave crops in MusiCorpus often omit a visible clef or key signature. The LMX compiler resolves and normalizes invisible G-clefs and transposes notes according to the Zeus/MusiCorpus specification.
-3. **Faster Training & I/O:** Pre-tokenized single-line `.lmx` files avoid expensive XML DOM tree parsing during every epoch.
-4. **Interoperability:** Enables direct comparison with official Zeus benchmarks and standard Symbol Error Rate (SER) tools.
-
-### Step 1: Install `linearized-musicxml`
-```bash
-pip install "linearized-musicxml @ git+https://github.com/OMR-Research/lmx.git@87fca1c38bda83bc032596ab00af28412f92941d"
+```mermaid
+graph TD
+    A["MusiCorpus Dataset<br/>(OmniOMR / Dolores)"] -->|"zeus musicorpus"| B["Zeus Dataset Folder<br/>(samples/*.jpg, *.lmx, *.musicxml)"]
+    B -->|"zeus pickle"| C["Pickled Dataset Slices<br/>(samples.{train|dev|test}.pickle)"]
+    C -->|"Run 1 (Zeus)"| D["Train PyTorch Zeus Baseline<br/>(Decodes images from pickle)"]
+    C -->|"extract_features.py"| E["MuSViT Feature Cache<br/>(*.pt in FP16)"]
+    E -->|"Run 2 (MuSViT)"| F["Train PyTorch MuSViT + Zeus<br/>(Loads pre-extracted features)"]
+    D --> G["Evaluate on Test Set<br/>(zeus.evaluation.symbol_error_rate)"]
+    F --> G
+    G --> H["Combined Results Table<br/>(results_table.md & csv)"]
 ```
 
-### Step 2: Generate `.lmx` Transcriptions
-Generate `transcription.lmx` beside each `transcription.musicxml` in your dataset:
-```bash
-python -m musvit_zeus_comparison.generate_lmx
-# Defaults to --dataset-dir UFAL.OmniOMR
+---
+
+## 2. Dataset Preparation: Convert & Pickle
+
+The dataset preparation converts MusiCorpus datasets (like OmniOMR and Dolores) into Zeus format and bundles them into fast binary `.pickle` files.
+
+### Understanding `splits.json` & Split Isolation
+In MusiCorpus datasets, train/val/test splits are defined **at the piece/page level** in a `splits.json` file in the dataset root:
+```json
+{
+  "train": ["piece_id_1", "piece_id_2", ...],
+  "dev": ["piece_id_3", ...],
+  "test": ["piece_id_4", ...]
+}
 ```
-*(Takes under 15 seconds for ~1,200 staves. Subsequent training automatically picks up these `.lmx` files).*
+*(Note: Zeus accepts `"dev"`, `"val"`, or `"validation"`).*
+
+### Step 1: Convert MusiCorpus to Zeus Format
+Run `zeus musicorpus` for each dataset. This applies invisible clef/key normalization and creates `samples.{train,dev,test}.txt`:
+
+```bash
+# Convert OmniOMR
+python -m zeus musicorpus \
+    --input datasets/OmniOMR \
+    --output datasets/omniomr \
+    --take-staves
+
+# Convert Dolores
+python -m zeus musicorpus \
+    --input datasets/Dolores \
+    --output datasets/dolores \
+    --take-staves
+```
+
+### Step 2: Pickle the Slices
+Bundle each split's loose images and LMX files into single `.pickle` files:
+
+```bash
+# Pickle OmniOMR
+python -m zeus pickle datasets/omniomr/samples.train.txt
+python -m zeus pickle datasets/omniomr/samples.dev.txt
+python -m zeus pickle datasets/omniomr/samples.test.txt
+
+# Pickle Dolores
+python -m zeus pickle datasets/dolores/samples.train.txt
+python -m zeus pickle datasets/dolores/samples.dev.txt
+python -m zeus pickle datasets/dolores/samples.test.txt
+```
+
+### How Splits Work With Multiple Datasets
+When multiple datasets are loaded into the training script:
+- **Zero Data Leakage:** Because splits are assigned at the page/piece level in each dataset, staves from the same page never cross splits.
+- **Combined Training Set:** `train_samples = omniomr_train + dolores_train`.
+- **Combined Validation Set:** `val_samples = omniomr_dev + dolores_dev`.
+- **Combined Test Set:** `test_samples = omniomr_test + dolores_test`.
+- **Unified Token Vocabulary:** Built from the combined training set (`train_samples`), ensuring all grammar tokens from both datasets are indexed.
 
 ---
 
-## 3. Running on the GPU Cluster
+## 3. Feature Pre-Extraction for MuSViT (Run 2)
 
-### Step 3: Pre-Extract Features (Run once on GPU)
-
-Extract and cache MuSViT embeddings for your dataset:
+Extracts and compresses visual features from the pickled images using pre-trained MuSViT.
+Applies **vertical mean pooling in FP16** to compress 12.6 MB patch grids down to **~98 KB per stave** (128x reduction, under 1 GB for 10,000 staves):
 
 ```bash
+# Auto-discovers all pickles in datasets/ (both OmniOMR and Dolores):
 python -m musvit_zeus_comparison.extract_features \
-    --dataset-dir UFAL.OmniOMR \
+    --datasets datasets \
     --output-dir feature_cache \
     --pool-mode vertical_mean \
     --precision float16 \
     --device cuda
 ```
-
-*Note: If interrupted, the script automatically resumes and skips already-extracted samples.*
+*(Or specify explicit pickle files. Automatically resumes and skips already-extracted samples if interrupted).*
 
 ---
 
-### Step 4: Run Training and Benchmark Comparison
+## 4. Training
 
-In the official TensorFlow Zeus implementation (`docs/training-zeus.md`), models are trained from scratch for **400 to 500 epochs** (`--epochs 500`, `--learning-rate 1e-3`, `--lr-decay cos`, `--batch-size 32/64`).
+Both models train on the exact same pickled slices, using the same hyperparameters matching Zeus (`--learning-rate 1e-3`, `--lr-decay cos`, `--optimizer adam`, `--batch-size 32`):
 
-#### Train from Scratch (Zeus Hyperparameters)
-```bash
-python -m musvit_zeus_comparison.train \
-    --model compare \
-    --dataset-dir UFAL.OmniOMR \
-    --feature-cache-dir feature_cache \
-    --output-dir experiment_results \
-    --epochs 200 \
-    --batch-size 32 \
-    --lr 1e-3 \
-    --optimizer adam \
-    --eval-interval 20 \
-    --device cuda
-```
+### Option A: Parallel SLURM Training on Cluster (Recommended)
+Submit both jobs to run concurrently on separate GPUs:
 
-#### Running via SLURM on the Cluster
-
-##### Option A: Parallel Execution (Recommended: 2x Faster)
-Submit Run 1 and Run 2 as two separate jobs to train concurrently on separate GPUs:
 ```bash
 # Submit Run 1: Zeus Baseline
 sbatch run_zeus.slurm
@@ -101,7 +115,8 @@ sbatch run_zeus.slurm
 # Submit Run 2: MuSViT + Zeus
 sbatch run_musvit.slurm
 ```
-Both jobs train simultaneously. Each exports its own results (`zeus_results.json` and `musvit_results.json`), and whichever job finishes second automatically merges both runs into the unified `results_table.md` and `results_table.csv`.
+
+Each job outputs its own results (`zeus_results.json` and `musvit_results.json`). Whichever job finishes second automatically merges both runs into `results_table.md` and `results_table.csv`.
 
 To monitor progress:
 ```bash
@@ -109,47 +124,99 @@ tail -f logs/slurm-zeus-baseline-*.out
 tail -f logs/slurm-musvit-zeus-*.out
 ```
 
-##### Option B: Sequential Comparison (Single Job)
-```bash
-sbatch run_comparison.slurm
-```
+### Option B: Interactive CLI Execution
 
-#### Fast Evaluation Only (Check Current Model Performance)
-To evaluate the latest or best saved checkpoints without training:
+#### Run 1: Zeus Baseline
 ```bash
 python -m musvit_zeus_comparison.train \
-    --model compare \
-    --resume auto \
-    --eval-only \
+    --model zeus \
+    --train datasets/omniomr/samples.train.pickle \
+    --dev datasets/omniomr/samples.dev.pickle \
+    --test datasets/omniomr/samples.test.pickle \
+    --epochs 200 \
+    --batch-size 32 \
+    --learning-rate 1e-3 \
+    --lr-decay cos \
+    --evaluation-each 10 \
+    --output-dir experiment_results \
     --device cuda
 ```
 
+#### Run 2: MuSViT + Zeus
+```bash
+python -m musvit_zeus_comparison.train \
+    --model musvit \
+    --train datasets/omniomr/samples.train.pickle \
+    --dev datasets/omniomr/samples.dev.pickle \
+    --test datasets/omniomr/samples.test.pickle \
+    --feature-cache-dir feature_cache \
+    --epochs 200 \
+    --batch-size 32 \
+    --learning-rate 1e-3 \
+    --lr-decay cos \
+    --evaluation-each 10 \
+    --output-dir experiment_results \
+    --device cuda
+```
+
+#### Multi-Dataset Training (e.g. OmniOMR + Dolores)
+
+When you have multiple datasets as subdirectories inside a shared `datasets/` folder (e.g. `datasets/omniomr/` and `datasets/dolores/`):
+
+1. **Automatic Discovery (Default):**
+   The training script and SLURM jobs automatically detect and combine all subdirectories containing `samples.train.pickle`, `samples.dev.pickle`, and `samples.test.pickle`:
+   ```bash
+   # Both datasets will be discovered and combined automatically:
+   sbatch run_zeus.slurm
+   sbatch run_musvit.slurm
+   ```
+   Or via CLI:
+   ```bash
+   python -m musvit_zeus_comparison.train --model zeus --dataset-dir datasets
+   python -m musvit_zeus_comparison.train --model musvit --dataset-dir datasets --feature-cache-dir feature_cache
+   ```
+
+2. **Explicit Paths:**
+   You can also explicitly pass multiple pickle files:
+   ```bash
+   python -m musvit_zeus_comparison.train \
+       --model zeus \
+       --train datasets/omniomr/samples.train.pickle datasets/dolores/samples.train.pickle \
+       --dev datasets/omniomr/samples.dev.pickle datasets/dolores/samples.dev.pickle \
+       --test datasets/omniomr/samples.test.pickle datasets/dolores/samples.test.pickle
+   ```
+
+
 ---
 
-### Step 5: Inspect the Generated Comparison Table
+## 5. Evaluation & Results
 
-Upon completion, a formatted summary table is printed to stdout and saved to:
-- `experiment_results/results_table.md` (Markdown format)
-- `experiment_results/results_table.csv` (Spreadsheet format)
+Evaluation uses `zeus.evaluation.symbol_error_rate` directly:
+1. **Validation SER:** Evaluated every `--evaluation-each` epochs during training.
+2. **Test SER:** After training completes, the best checkpoint is evaluated on the official test set.
 
-Example output table:
+Results are printed to stdout and saved in `experiment_results/`:
+- `results_table.md` (Markdown format)
+- `results_table.csv` (Spreadsheet format)
 
-| Model Run | Encoder | Enc Params | Dec Params | Total Params | Val Loss (best) | Token Acc (%) | SER / NED (%) | Train Time (s) |
+Example output:
+
+| Model Run | Encoder | Enc Params | Dec Params | Total Params | Val Loss (best) | Token Acc (%) | Val SER (%) | Test SER (%) | Train Time (s) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Zeus Baseline (Run 1)** | CNN-BiLSTM | 851,200 | 1,185,420 | 2,036,620 | 0.8241 | 82.15% | 18.42% | 145.2s |
-| **MuSViT + Zeus (Run 2)** | MuSViT + Adapter | 394,496 | 1,185,420 | 1,579,916 | 0.5120 | 89.64% | 11.20% | 42.1s |
+| **Zeus Baseline (Run 1)** | CNN-BiLSTM | 851,200 | 1,185,420 | 2,036,620 | 0.8241 | 82.15% | 18.42% | 19.10% | 145.2s |
+| **MuSViT + Zeus (Run 2)** | MuSViT + Adapter | 394,496 | 1,185,420 | 1,579,916 | 0.5120 | 89.64% | 11.20% | 11.85% | 42.1s |
 
 ---
 
-## 4. Directory Layout
+## 6. Directory Layout
 
 ```
 musvit_zeus_comparison/
 ├── __init__.py          # Package exports
 ├── models.py            # ZeusEncoder, MusvitEncoder, ZeusDecoder, CombinedOMRModel
-├── dataset.py           # StaveOMRDataset (supports image + feature loading) & StaveCollate
-├── generate_lmx.py      # MusicXML to official LMX transcription generator
-├── extract_features.py  # Feature extractor with vertical pooling & FP16 compression
+├── dataset.py           # In-memory ZeusDatasetSample loader, TokenVocabulary, StaveCollate
+├── extract_features.py  # MuSViT feature extractor with vertical pooling & FP16 compression
 ├── train.py             # Main trainer & evaluator with automated table generation
-└── README.md            # Detailed documentation
+├── zeus/                # Embedded Zeus core modules (data, evaluation, musicorpus)
+└── README.md            # Documentation
 ```

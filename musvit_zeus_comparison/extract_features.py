@@ -2,23 +2,31 @@
 Feature Pre-Extraction Script for MuSViT.
 
 Extracts and compresses visual features from single stave images using pre-trained MuSViT.
-Addresses disk size by applying vertical pooling and FP16 half-precision:
-- Full uncompressed patch embeddings: ~12.6 MB per stave (126 GB for 10,000 staves)
-- Vertical Mean Pooling (FP16): ~98 KB per stave (under 1 GB for 10,000 staves) -> 128x smaller!
-- Vertical 4-Slice Pooling (FP16): ~393 KB per stave (~3.9 GB for 10,000 staves) -> 32x smaller!
-
-Can be run on the GPU cluster before training to eliminate ViT training overhead.
+Follows the Zeus repository workflow:
+- Reads samples directly from Zeus pickled datasets (samples.train.pickle, samples.dev.pickle, samples.test.pickle).
+- Applies vertical pooling and FP16 half-precision:
+  - Vertical Mean Pooling (FP16): ~98 KB per stave (under 1 GB for 10,000 staves) -> 128x smaller!
+  - Vertical 4-Slice Pooling (FP16): ~393 KB per stave (~3.9 GB for 10,000 staves) -> 32x smaller!
 """
 
+from __future__ import annotations
+
 import argparse
+import io
 import json
 import os
+import sys
 from pathlib import Path
 
 import torch
 from PIL import Image
 from torchvision import transforms as T
 from tqdm import tqdm
+
+try:
+    from musvit_zeus_comparison.dataset import ZeusDatasetSample, load_zeus_pickles
+except ImportError:
+    from dataset import ZeusDatasetSample, load_zeus_pickles
 
 try:
     from transformers import AutoModel, ViTModel
@@ -32,24 +40,6 @@ def get_transform(image_size: int = 1024) -> T.Compose:
         T.Resize([image_size, image_size]),
         T.ToTensor(),
     ])
-
-
-def find_staves(dataset_dir: str | Path) -> list[Path]:
-    """Finds all stave images in standard MusiCorpus / OmniOMR layout."""
-    base_path = Path(dataset_dir)
-    if not base_path.exists():
-        raise FileNotFoundError(f"Dataset directory '{dataset_dir}' does not exist.")
-
-    staves = sorted(list(base_path.glob("*/Staves/*/image.jpg")))
-    if not staves:
-        staves = sorted(list(base_path.glob("*/*/Staves/*/image.jpg")))
-    if not staves:
-        staves = sorted(list(base_path.rglob("Staves/*/image.jpg")))
-    if not staves:
-        # Generic fallback for any jpg/png images
-        staves = sorted(list(base_path.rglob("*.jpg")) + list(base_path.rglob("*.png")))
-
-    return staves
 
 
 def load_musvit(model_name: str = "PRAIG/musvit", device: str = "cuda", token: str | None = None):
@@ -85,30 +75,40 @@ def pool_embeddings(patch_embeddings: torch.Tensor, mode: str = "vertical_mean")
     grid_dim = int(patch_embeddings.shape[1] ** 0.5)  # 64
     dim = patch_embeddings.shape[2]  # 768
 
-    # Reshape to spatial 2D grid: (1, 64, 64, 768) -> (1, 768, 64, 64)
     grid = patch_embeddings.view(1, grid_dim, grid_dim, dim).permute(0, 3, 1, 2)
 
     if mode == "vertical_mean":
-        # Average pool across the vertical axis (dim 2) -> (1, 768, 1, 64) -> (64, 768)
         pooled = grid.mean(dim=2).squeeze(0).permute(1, 0)
         return pooled
-
     elif mode == "vertical_4slice":
-        # Adaptive average pool across height into 4 bins -> (1, 768, 4, 64) -> (256, 768)
         pooled = torch.nn.functional.adaptive_avg_pool2d(grid, (4, 64))
-        # Flatten spatial (4, 64) -> 256
         pooled = pooled.squeeze(0).permute(1, 2, 0).reshape(4 * 64, dim)
         return pooled
-
     elif mode == "full":
-        return patch_embeddings.squeeze(0)  # (4096, 768)
-
+        return patch_embeddings.squeeze(0)
     else:
         raise ValueError(f"Unknown pooling mode '{mode}'. Choose 'vertical_mean', 'vertical_4slice', or 'full'.")
 
 
+def resolve_pickle_files(input_paths: list[str | Path]) -> list[Path]:
+    """Finds all Zeus .pickle files from list of files or directories."""
+    pickle_files = []
+    for p in input_paths:
+        path = Path(p)
+        if path.is_file() and path.suffix == ".pickle":
+            pickle_files.append(path)
+        elif path.is_dir():
+            found = sorted(list(path.glob("*.pickle")) + list(path.glob("*/*.pickle")))
+            pickle_files.extend(found)
+        else:
+            cand = path.with_suffix(".pickle")
+            if cand.is_file():
+                pickle_files.append(cand)
+    return sorted(list(set(pickle_files)))
+
+
 def extract_and_cache(
-    dataset_dir: str | Path,
+    input_paths: list[str | Path],
     output_dir: str | Path,
     model_name: str = "PRAIG/musvit",
     pool_mode: str = "vertical_mean",
@@ -117,103 +117,83 @@ def extract_and_cache(
     token: str | None = None,
     skip_existing: bool = True,
 ):
-    dataset_path = Path(dataset_dir)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    staves = find_staves(dataset_path)
-    print(f"Found {len(staves)} stave images in '{dataset_dir}'.")
-    if not staves:
-        print("No stave images found! Exiting.")
-        return
+    pickle_files = resolve_pickle_files(input_paths)
+    if not pickle_files:
+        raise FileNotFoundError(f"No Zeus dataset .pickle files found in: {input_paths}")
+
+    print(f"Found {len(pickle_files)} Zeus dataset pickle file(s):")
+    for pf in pickle_files:
+        print(f"  - {pf}")
+
+    # Load samples directly from pickles
+    samples = load_zeus_pickles(pickle_files)
+    # Deduplicate by sample_name
+    unique_samples = {}
+    for s in samples:
+        if s.sample_name not in unique_samples:
+            unique_samples[s.sample_name] = s
+    sample_list = list(unique_samples.values())
+    print(f"Total unique stave samples to extract: {len(sample_list):,}")
 
     model = load_musvit(model_name=model_name, device=device, token=token)
     transform = get_transform(image_size=1024)
-
     dtype = torch.float16 if precision == "float16" else torch.float32
 
-    manifest = []
     skipped_count = 0
     saved_count = 0
 
     print(f"Extracting features with pooling='{pool_mode}', precision='{precision}'...")
-    for img_path in tqdm(staves, desc="Extracting features"):
-        # Generate stable cache filename based on relative path or hash
-        rel_path = img_path.relative_to(dataset_path) if dataset_path in img_path.parents else img_path.name
-        rel_str = str(rel_path).replace("\\", "_").replace("/", "_").replace(".jpg", "").replace(".png", "")
-        feat_filename = f"{rel_str}_{pool_mode}_{precision}.pt"
+    for sample in tqdm(sample_list, desc="Extracting features"):
+        sample_slug = sample.sample_name.replace("/", "_").replace("\\", "_")
+        feat_filename = f"{sample_slug}_{pool_mode}_{precision}.pt"
         feat_path = output_path / feat_filename
 
-        manifest_entry = {
-            "image_path": str(img_path.resolve()),
-            "feature_path": str(feat_path.resolve()),
-            "relative_path": str(rel_path),
-        }
-
-        # Check for matching transcription (MusicXML or LMX)
-        musicxml_path = img_path.parent / "transcription.musicxml"
-        if musicxml_path.exists():
-            manifest_entry["musicxml_path"] = str(musicxml_path.resolve())
-
-        lmx_path = img_path.parent / "transcription.lmx"
-        # Check if already cached under direct path or canonical stave key
-        existing_feat = None
-        if skip_existing:
-            if feat_path.is_file():
-                existing_feat = feat_path
-            elif "Staves" in img_path.parts:
-                parts = img_path.parts
-                staves_idx = parts.index("Staves")
-                if staves_idx > 0 and staves_idx + 1 < len(parts):
-                    stave_key = f"{parts[staves_idx - 1]}_Staves_{parts[staves_idx + 1]}_{img_path.stem}"
-                    cand = output_path / f"{stave_key}_{pool_mode}_{precision}.pt"
-                    if cand.is_file():
-                        existing_feat = cand
-
-        if existing_feat is not None:
-            manifest_entry["feature_path"] = str(existing_feat.resolve())
-            manifest.append(manifest_entry)
+        if skip_existing and feat_path.is_file():
             skipped_count += 1
             continue
 
-        manifest.append(manifest_entry)
-
         try:
-            image = Image.open(img_path).convert("RGB")
+            image = Image.open(io.BytesIO(sample.image)).convert("RGB")
             input_tensor = transform(image).unsqueeze(0).to(device)
 
             with torch.no_grad():
                 outputs = model(input_tensor)
                 last_hidden_state = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
                 patch_embeddings = last_hidden_state[:, 1:, :]  # drop [CLS] -> (1, 4096, 768)
-
                 pooled = pool_embeddings(patch_embeddings, mode=pool_mode).to(dtype=dtype, device="cpu")
 
             torch.save(pooled, feat_path)
             saved_count += 1
 
         except Exception as e:
-            print(f"\n[Warning] Failed on {img_path}: {e}")
-
-    # Save manifest JSON for fast dataset lookup
-    manifest_path = output_path / "manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+            print(f"\n[Warning] Failed on sample '{sample.sample_name}': {e}")
 
     total_size_mb = sum(p.stat().st_size for p in output_path.glob("*.pt")) / (1024 * 1024)
     print("\nExtraction Complete!")
-    print(f"  - Saved new features: {saved_count}")
-    print(f"  - Skipped (already cached): {skipped_count}")
+    print(f"  - Saved new features: {saved_count:,}")
+    print(f"  - Skipped (already cached): {skipped_count:,}")
     print(f"  - Total cache size: {total_size_mb:.2f} MB")
-    print(f"  - Manifest written to: {manifest_path}")
+    print(f"  - Output directory: {output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pre-extract and compress MuSViT features for single staves.")
-    parser.add_argument("--dataset-dir", type=str, default="UFAL.OmniOMR", help="Path to input dataset (default: UFAL.OmniOMR).")
+    parser = argparse.ArgumentParser(description="Pre-extract and compress MuSViT features from Zeus dataset pickles.")
+    parser.add_argument(
+        "--datasets",
+        "--dataset-dir",
+        "--input",
+        dest="inputs",
+        type=str,
+        nargs="+",
+        default=["datasets"],
+        help="Path(s) to dataset pickle files (e.g. datasets/omniomr/samples.train.pickle) or dataset directory.",
+    )
     parser.add_argument("--output-dir", type=str, default="feature_cache", help="Path to save pre-extracted features.")
     parser.add_argument("--model-name", type=str, default="PRAIG/musvit", help="HuggingFace model ID.")
     parser.add_argument(
@@ -230,7 +210,7 @@ def main():
 
     args = parser.parse_args()
     extract_and_cache(
-        dataset_dir=args.dataset_dir,
+        input_paths=args.inputs,
         output_dir=args.output_dir,
         model_name=args.model_name,
         pool_mode=args.pool_mode,
