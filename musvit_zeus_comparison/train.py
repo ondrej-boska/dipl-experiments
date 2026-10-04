@@ -403,6 +403,7 @@ def train_single_model(
         )
         return {
             "model": "Zeus Baseline (Run 1)" if model_type == "zeus" else "MuSViT + Zeus (Run 2)",
+            "model_type": model_type,
             "encoder": "CNN-BiLSTM" if model_type == "zeus" else "MuSViT + Adapter",
             "enc_params": enc_params,
             "dec_params": dec_params,
@@ -573,6 +574,7 @@ def train_single_model(
 
     return {
         "model": "Zeus Baseline (Run 1)" if model_type == "zeus" else "MuSViT + Zeus (Run 2)",
+        "model_type": model_type,
         "encoder": "CNN-BiLSTM" if model_type == "zeus" else "MuSViT + Adapter",
         "enc_params": enc_params,
         "dec_params": dec_params,
@@ -588,9 +590,40 @@ def train_single_model(
 
 
 def export_results_table(results: list[dict], output_dir: str | Path):
-    """Formats and writes a comparison table to Markdown, CSV, and stdout."""
+    """Formats and writes a comparison table to Markdown, CSV, and stdout.
+    Automatically merges with previously finished runs (e.g. when Run 1 and Run 2 are run in separate jobs).
+    """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Save individual JSON results for each finished model
+    for r in results:
+        m_type = r.get("model_type", "zeus" if "Zeus" in r.get("model", "") else "musvit")
+        json_path = out_dir / f"{m_type}_results.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            serializable = {k: v for k, v in r.items() if k != "history"}
+            json.dump(serializable, f, indent=2)
+
+    # 2. Check for previously saved counterpart run to merge into combined table
+    all_runs: dict[str, dict] = {}
+    for other_type in ["zeus", "musvit"]:
+        cand_json = out_dir / f"{other_type}_results.json"
+        if cand_json.is_file():
+            try:
+                with open(cand_json, "r", encoding="utf-8") as f:
+                    all_runs[other_type] = json.load(f)
+            except Exception:
+                pass
+
+    for r in results:
+        m_type = r.get("model_type", "zeus" if "Zeus" in r.get("model", "") else "musvit")
+        all_runs[m_type] = r
+
+    merged_results = list(all_runs.values())
+    # Sort Zeus first, then MuSViT
+    merged_results.sort(
+        key=lambda x: 0 if "run 1" in str(x.get("model", "")).lower() or x.get("model_type") == "zeus" else 1
+    )
 
     headers = [
         "Model Run",
@@ -605,7 +638,7 @@ def export_results_table(results: list[dict], output_dir: str | Path):
     ]
 
     rows = []
-    for r in results:
+    for r in merged_results:
         rows.append([
             r["model"],
             r["encoder"],
@@ -638,8 +671,8 @@ def export_results_table(results: list[dict], output_dir: str | Path):
         for r in rows:
             f.write("| " + " | ".join(r) + " |\n")
         f.write("\n### Key Takeaways:\n")
-        if len(results) >= 2:
-            r1, r2 = results[0], results[1]
+        if len(merged_results) >= 2:
+            r1, r2 = merged_results[0], merged_results[1]
             ser_diff = r1["ser"] - r2["ser"]
             speed_ratio = r1["total_time_sec"] / max(1e-3, r2["total_time_sec"])
             if ser_diff > 0:

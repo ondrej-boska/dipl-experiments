@@ -91,18 +91,27 @@ python -m musvit_zeus_comparison.train \
 ```
 
 #### Running via SLURM on the Cluster
-Submit as a background batch job (automatically allocates 1 GPU, 4 CPUs, 24G RAM on `-p gpu`):
+
+##### Option A: Parallel Execution (Recommended: 2x Faster)
+Submit Run 1 and Run 2 as two separate jobs to train concurrently on separate GPUs:
 ```bash
-sbatch run_comparison.slurm
+# Submit Run 1: Zeus Baseline
+sbatch run_zeus.slurm
+
+# Submit Run 2: MuSViT + Zeus
+sbatch run_musvit.slurm
 ```
-To monitor progress in real-time:
+Both jobs train simultaneously. Each exports its own results (`zeus_results.json` and `musvit_results.json`), and whichever job finishes second automatically merges both runs into the unified `results_table.md` and `results_table.csv`.
+
+To monitor progress:
 ```bash
-tail -f logs/slurm-musvit-zeus-comp-*.out
+tail -f logs/slurm-zeus-baseline-*.out
+tail -f logs/slurm-musvit-zeus-*.out
 ```
 
-Or run interactively inside your allocation:
+##### Option B: Sequential Comparison (Single Job)
 ```bash
-srun -p gpu -G1 -c4 --mem=24G bash run_comparison.slurm
+sbatch run_comparison.slurm
 ```
 
 #### Fast Evaluation Only (Check Current Model Performance)
