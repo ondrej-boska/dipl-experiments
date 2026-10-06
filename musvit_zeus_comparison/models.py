@@ -10,9 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def lengths_to_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
-    """(B,) lengths -> (B, max_len) bool mask, True at valid timesteps."""
-    return torch.arange(max_len, device=lengths.device)[None, :] < lengths[:, None]
+def lengths_to_mask(lengths: torch.Tensor, max_len: int, device: torch.device) -> torch.Tensor:
+    """(B,) lengths -> (B, max_len) bool mask on `device`, True at valid timesteps."""
+    lengths = lengths.to(device, non_blocking=True)
+    return torch.arange(max_len, device=device)[None, :] < lengths[:, None]
 
 
 # ==============================================================================
@@ -144,7 +145,7 @@ class ZeusDecoder(nn.Module):
         preds = []
         is_finished = torch.zeros(batch_size, dtype=torch.bool, device=context.device)
 
-        for _ in range(max_len):
+        for step in range(max_len):
             x_t = self.embedding(curr_token)  # (B, dim)
             ctx_t, _ = self.attention(context, encoder_proj, (h, c), mask=context_mask)
             lstm_input = torch.cat([x_t, ctx_t], dim=-1)
@@ -157,7 +158,8 @@ class ZeusDecoder(nn.Module):
             preds.append(token_to_record)
 
             is_finished = is_finished | (next_token == self.eos_idx)
-            if is_finished.all():
+            # Checking on the CPU waits for the GPU, so do it only every few steps; extra steps only add padding
+            if step % 8 == 7 and is_finished.all():
                 break
             curr_token = torch.where(is_finished, torch.full_like(next_token, self.pad_idx), next_token)
 
@@ -213,7 +215,8 @@ class BiLSTMSumBlock(nn.Module):
         if lengths is None:
             out, _ = self.lstm(x)  # (B, T, 2 * out_dim)
         else:
-            # Packing keeps the backward direction from reading the batch padding first
+            # Packing keeps the backward direction from reading the batch padding first.
+            # It needs the lengths on the CPU; keeping them there avoids waiting for the GPU.
             packed = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
             out, _ = self.lstm(packed)
             out, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True, total_length=x.shape[1])
@@ -291,7 +294,7 @@ class ZeusEncoder(nn.Module):
         return (lengths + self.remaining - 1) // self.remaining
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # x: (B, 1, H, W), lengths: optional (B,) unpadded image widths
+        # x: (B, 1, H, W), lengths: optional (B,) unpadded image widths, preferably on the CPU
         feat = self.conv(x)  # (B, C, H', W')
         B, C, H, W = feat.shape
 
@@ -311,7 +314,7 @@ class ZeusEncoder(nn.Module):
         for layer in self.rnn:
             out = layer(out, steps)  # (B, W // remaining, dim)
 
-        mask = lengths_to_mask(steps, out.shape[1]) if steps is not None else None
+        mask = lengths_to_mask(steps, out.shape[1], out.device) if steps is not None else None
         return out, mask
 
 
@@ -352,7 +355,7 @@ class MusvitEncoder(nn.Module):
         Args:
             features: (B, T, musvit_dim) pre-extracted MuSViT features
                 (e.g. T=64 patch columns with 4 rows of 768 concatenated, musvit_dim=3072)
-            lengths: optional (B,) unpadded sequence lengths
+            lengths: optional (B,) unpadded sequence lengths, preferably on the CPU
         Returns:
             context: (B, T, dim) ready for ZeusDecoder, and the (B, T) mask of valid timesteps
         """
@@ -363,7 +366,7 @@ class MusvitEncoder(nn.Module):
         context = self.lstm(projected, lengths)
         context = self.layer_norm(context + projected)  # Residual connection
 
-        mask = lengths_to_mask(lengths, context.shape[1]) if lengths is not None else None
+        mask = lengths_to_mask(lengths, context.shape[1], context.device) if lengths is not None else None
         return context, mask
 
 

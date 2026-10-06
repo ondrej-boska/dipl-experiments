@@ -12,12 +12,14 @@ Follows the Zeus repository workflow:
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
+from tqdm import tqdm
 
 try:
     from musvit_zeus_comparison.zeus.data.zeus_dataset import ZeusDataset, ZeusDatasetSample
@@ -170,16 +172,23 @@ def resolve_split_pickle(spec: str | Path, dataset_dir: str | Path, split: str) 
     )
 
 
-def load_split(specs: list[str], dataset_dir: str | Path, split: str) -> SplitSamples:
-    """Loads the predefined `split` of each selected dataset."""
+def load_split(specs: list[str], dataset_dir: str | Path, split: str, keep_images: bool = True) -> SplitSamples:
+    """
+    Loads the predefined `split` of each selected dataset.
+    Without `keep_images`, the image bytes are dropped after loading, to save memory when only
+    pre-extracted features are used.
+    """
     loaded: SplitSamples = {}
     for spec in specs:
         pickle_path = resolve_split_pickle(spec, dataset_dir, split)
         name = dataset_name(pickle_path)
         if name in loaded:
             raise ValueError(f"Dataset '{name}' is selected more than once for the '{split}' split.")
-        loaded[name] = ZeusDataset.load_from_pickle_file(pickle_path).samples
-        print(f"Loaded {len(loaded[name]):,} {split} samples of '{name}' from '{pickle_path}'")
+        samples = ZeusDataset.load_from_pickle_file(pickle_path).samples
+        if not keep_images:
+            samples = [ZeusDatasetSample(sample_name=s.sample_name, image=b"", lmx=s.lmx) for s in samples]
+        loaded[name] = samples
+        print(f"Loaded {len(samples):,} {split} samples of '{name}' from '{pickle_path}'")
     return loaded
 
 
@@ -194,6 +203,16 @@ def feature_cache_path(cache_dir: str | Path, dataset: str, sample_name: str, va
     Namespaced by dataset, since sample names are only unique within a dataset.
     """
     return Path(cache_dir) / dataset / variant / f"{sample_name}.pt"
+
+
+def missing_feature_files(samples: SplitSamples, cache_dir: str | Path, variant: str) -> list[Path]:
+    """Feature files of the given samples that have not been extracted yet."""
+    paths = (
+        feature_cache_path(cache_dir, name, sample.sample_name, variant)
+        for name, dataset_samples in samples.items()
+        for sample in dataset_samples
+    )
+    return [path for path in paths if not path.is_file()]
 
 
 # ==============================================================================
@@ -218,6 +237,7 @@ class StaveOMRDataset(Dataset):
         feature_cache_dir: str | Path | None = None,
         feature_variant: str = "stave64_float16",
         feature_layout: str = "columns",  # 'columns' or 'raster'
+        preload_features: bool = False,
         image_height: int = 96,  # Zeus single-staff standard height
         max_image_width: int = 1536,
     ):
@@ -235,6 +255,11 @@ class StaveOMRDataset(Dataset):
         if feature_layout not in ("columns", "raster"):
             raise ValueError(f"Unknown feature_layout '{feature_layout}'. Must be 'columns' or 'raster'.")
 
+        # Reading every feature file once up front, instead of in every epoch, spares slow (e.g. network) filesystems
+        self.features: list[torch.Tensor] | None = None
+        if self.mode == "musvit" and preload_features and len(self) > 0:
+            self.features = [self._load_grid(i) for i in tqdm(range(len(self)), desc="Preloading features")]
+
     def __len__(self) -> int:
         return len(self.items)
 
@@ -250,9 +275,24 @@ class StaveOMRDataset(Dataset):
         name, sample = self.items[idx]
         return feature_cache_path(self.feature_cache_dir, name, sample.sample_name, self.feature_variant)
 
-    def missing_features(self) -> list[Path]:
-        """Feature files that have not been extracted yet (mode 'musvit' only)."""
-        return [path for path in map(self.feature_path, range(len(self))) if not path.is_file()]
+    def target_lengths(self) -> list[int]:
+        """Number of LMX tokens of each sample, in dataset order."""
+        return [len(sample.lmx.split()) for _, sample in self.items]
+
+    def _load_grid(self, idx: int) -> torch.Tensor:
+        """The (rows, columns, dim) MuSViT patch grid of a sample, as stored (FP16 or FP32)."""
+        if self.features is not None:
+            return self.features[idx]
+        feat_path = self.feature_path(idx)
+        if not feat_path.is_file():
+            raise FileNotFoundError(
+                f"Pre-extracted MuSViT feature file not found for sample '{self.items[idx][1].sample_name}'. "
+                f"Looked at: '{feat_path}'. Please run extract_features.py before training MuSViT."
+            )
+        grid = torch.load(feat_path, map_location="cpu", weights_only=True)
+        if grid.dim() != 3:
+            raise ValueError(f"Expected a (rows, columns, dim) patch grid in '{feat_path}', got shape {tuple(grid.shape)}.")
+        return grid
 
     def _load_image(self, image_bytes: bytes, sample_name: str) -> torch.Tensor:
         """Loads and normalizes image for Zeus (Run 1). Height is fixed, width preserves aspect ratio."""
@@ -274,15 +314,7 @@ class StaveOMRDataset(Dataset):
         token_tensor = torch.tensor(self.vocab.encode(sample.lmx.split()), dtype=torch.long)
 
         if self.mode == "musvit":
-            feat_path = self.feature_path(idx)
-            if not feat_path.is_file():
-                raise FileNotFoundError(
-                    f"Pre-extracted MuSViT feature file not found for sample '{sample.sample_name}'. "
-                    f"Looked at: '{feat_path}'. Please run extract_features.py before training MuSViT."
-                )
-            grid = torch.load(feat_path, map_location="cpu", weights_only=True).float()
-            if grid.dim() != 3:
-                raise ValueError(f"Expected a (rows, columns, dim) patch grid in '{feat_path}', got shape {tuple(grid.shape)}.")
+            grid = self._load_grid(idx).float()
             rows, columns, dim = grid.shape
             if self.feature_layout == "columns":
                 # Like the Zeus encoder flattening H x C per column, keeps the vertical (pitch) position
@@ -354,3 +386,46 @@ class StaveCollate:
         batch_target_labels = torch.stack(batch_target_labels, dim=0)
 
         return batch_inputs, input_lengths, batch_input_seqs, batch_target_labels
+
+
+# ==============================================================================
+# Length-Bucketed Batching
+# ==============================================================================
+
+class LengthBucketBatchSampler(Sampler[list[int]]):
+    """
+    Batches samples of similar transcription length. The decoder runs for the longest transcription
+    of a batch, so mixing short and long ones wastes most of its steps on padding.
+
+    - shuffle=True: samples are shuffled, sorted by length within pools of `pool_batches` batches,
+      cut into batches, and the batches are shuffled. A pool of 1 batch means plain random batches.
+    - shuffle=False: batches follow the length order, deterministically (for evaluation).
+    """
+    def __init__(self, lengths: list[int], batch_size: int, shuffle: bool, pool_batches: int = 50):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.pool_batches = max(1, pool_batches)
+
+    def _batches(self, order: list[int]) -> list[list[int]]:
+        return [order[i:i + self.batch_size] for i in range(0, len(order), self.batch_size)]
+
+    def __iter__(self):
+        if not self.shuffle:
+            yield from self._batches(sorted(range(len(self.lengths)), key=self.lengths.__getitem__))
+            return
+
+        # Seeded from the global RNG like torch's RandomSampler, so seeding and resuming stay reproducible
+        generator = torch.Generator()
+        generator.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+        permutation = torch.randperm(len(self.lengths), generator=generator).tolist()
+        pool_size = self.batch_size * self.pool_batches
+        batches = []
+        for start in range(0, len(permutation), pool_size):
+            pool = sorted(permutation[start:start + pool_size], key=self.lengths.__getitem__)
+            batches.extend(self._batches(pool))
+        for i in torch.randperm(len(batches), generator=generator).tolist():
+            yield batches[i]
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.lengths) / self.batch_size)

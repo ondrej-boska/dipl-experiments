@@ -105,6 +105,7 @@ python -m musvit_zeus_comparison.extract_features \
     --stave-height 64 \
     --precision float16 \
     --batch-size 8 \
+    --num-workers 4 \
     --device cuda
 
 # Only some datasets (names of subfolders of --dataset-dir, dataset folders, or .pickle files):
@@ -114,6 +115,9 @@ python -m musvit_zeus_comparison.extract_features --datasets omniomr dolores
 `--stave-height` sets the height staves are resized to, as a multiple of 16 (the patch size); the number of kept patch rows is `height / 16`.
 64 follows the MuSViT documentation. 96 is closer to the median aspect ratio of OmniOMR staves (about 10:1, whereas 1024 x 64 is 16:1), at 1.5x the cache size.
 The compute per stave is the same for every height, since MuSViT always processes the whole 1024 x 1024 canvas.
+
+Speed: `--num-workers` processes decode and resize the images ahead of the GPU, and only the stave band is sent to the GPU, where the white canvas is added.
+`--tf32` runs the matrix multiplications on the TF32 tensor cores of Ampere and newer GPUs (A16, A4000, L4, ...). It is several times faster but slightly less precise (a 10-bit mantissa, like the FP16 storage), so features extracted with and without it differ slightly. Use one setting for a whole cache.
 
 Features are stored per dataset and setting as `feature_cache/<dataset>/stave<height>_<precision>/<sample_name>.pt`, since sample names are only unique within a dataset; several heights can be cached side by side.
 In FP16, a stave takes `height / 16 x 64 x 768 x 2` bytes, i.e. ~393 KB at height 64 (~3.9 GB for 10,000 staves).
@@ -135,8 +139,8 @@ Both models train on the exact same pickled slices, using the same hyperparamete
 | `--dataset-dir DIR` | Directory with the datasets as subfolders (default: `datasets`). |
 | `--datasets A B ...` | Datasets used for all splits unless overridden (default: all datasets in `--dataset-dir`). |
 | `--train A B ...` | Datasets whose `train` split is used for training (default: `--datasets`). |
-| `--dev A B ...` | Datasets whose `dev` split is used for validation and checkpoint selection (default: `--datasets`). |
-| `--test A B ...` | Datasets whose `test` split is used for testing (default: `--datasets`); `--test` without values skips testing. |
+| `--dev A B ...` | Datasets whose `dev` split is used for validation and checkpoint selection (default: `--datasets`, or the `--train` datasets if `--datasets` is not given). |
+| `--test A B ...` | Datasets whose `test` split is used for testing (default: `--datasets`, or the `--train` datasets if `--datasets` is not given); `--test` without values skips testing. |
 
 Each dataset is given as the name of a subfolder of `--dataset-dir`, a path to a dataset folder, or a path to a `.pickle` file.
 For the dev split, `samples.val.pickle` and `samples.validation.pickle` are accepted as well.
@@ -152,6 +156,7 @@ python -m musvit_zeus_comparison.train --model zeus \
     --test omniomr dolores
 ```
 
+So `--train omniomr` alone trains, validates and tests on OmniOMR only.
 When several test datasets are selected, the test SER is reported for their combination and for each dataset separately.
 
 ### Option A: Parallel SLURM Training on Cluster (Recommended)
@@ -208,16 +213,27 @@ python -m musvit_zeus_comparison.train \
     --device cuda
 ```
 
-The MuSViT run checks before training that features of all selected samples have been extracted with the given `--feature-stave-height` and `--feature-precision`.
+Before any training starts (also before the Zeus run of `--model compare`), it is checked that MuSViT features of all selected samples have been extracted with the given `--feature-stave-height` and `--feature-precision`.
+With `--model compare`, the results are exported after each run, so a finished Zeus run is kept even if the MuSViT run fails.
 
 `--feature-layout` decides how the `(rows, 64, 768)` patch grid of a stave becomes the encoder's input sequence:
 - `columns` (default): one timestep per patch column, with the rows of that column concatenated, i.e. `(64, rows x 768)`. This keeps the vertical position (pitch) of every patch, like the Zeus encoder flattening height x channels per column.
 - `raster`: the row-major patch sequence of the MuSViT documentation (`flatten(1, 2)`), i.e. `(rows x 64, 768)`.
 
+### Training Speed
+The following are on by default and do not change what is computed (beyond floating-point rounding):
+- **Length-bucketed batches:** the decoder runs for the longest transcription of a batch, so training batches are formed from pools of `--length-bucket-batches` (default 50) batches sorted by transcription length, and the batches are then shuffled. On the OmniOMR + Dolores length distribution, this cuts the decoder steps spent on padding from about 50% to a few percent. `--length-bucket-batches 1` gives plain random batches. Evaluation batches are sorted by length, and predictions are put back in dataset order.
+- **TF32 matrix multiplications** on Ampere and newer GPUs (A16, A4000, L4, ...) for the decoder LSTM cell, the attention and the projections. PyTorch already uses TF32 for convolutions and cuDNN LSTMs by default. `--no-tf32` computes them in full FP32.
+- **Fused Adam / AdamW** on CUDA, **pinned memory** with asynchronous copies to the GPU, and **persistent DataLoader workers**, which are not re-forked for every epoch.
+- **No waiting for the GPU** after every batch: losses are accumulated on the GPU, sequence lengths stay on the CPU for packing, and greedy decoding checks for finished sequences only every 8 steps.
+
+`--preload-features` reads all MuSViT feature files into RAM once (~0.4 MB per stave at height 64, ~4.6 GB for OmniOMR + Dolores) instead of from disk in every epoch, which helps on slow (e.g. network) filesystems.
+The MuSViT-only run drops the stave images after loading, since it only uses the extracted features.
+
 ### Checkpoints and Resuming
 - `<model>_best.pt` is the checkpoint with the lowest validation SER (evaluated every `--evaluation-each` epochs). With `--evaluation-each 0`, the lowest validation loss is used instead.
 - `<model>_latest.pt` is written after every epoch. Both hold the model, optimizer and RNG state, the vocabulary and the training history.
-- `--resume auto` continues from `<model>_latest.pt` exactly where training stopped; `--resume <path.pt>` continues from a given checkpoint (single `--model` only). `--epochs` may be raised when resuming; the cosine schedule follows the new value.
+- `--resume auto` continues from `<model>_latest.pt` exactly where training stopped (the same losses as an uninterrupted run, for any `--num-workers`); `--resume <path.pt>` continues from a given checkpoint (single `--model` only). `--epochs` may be raised when resuming; the cosine schedule follows the new value.
 - `--eval-only` evaluates `<model>_best.pt` (or the checkpoint given by `--resume`) without training.
 - `--max-gen-length` defaults to 1.2x the longest training transcription; a warning is printed if dev/test transcriptions are longer.
 

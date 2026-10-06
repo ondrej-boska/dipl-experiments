@@ -53,16 +53,45 @@ except ImportError:
     ViTModel = None
 
 
-def prepare_stave(image: Image.Image, canvas_size: int = 1024, stave_height: int = 64) -> torch.Tensor:
+def prepare_stave_band(image: Image.Image, canvas_size: int = 1024, stave_height: int = 64) -> torch.Tensor:
     """
-    MuSViT's documented stave input: the stave resized to the full canvas width and `stave_height`,
-    pasted at the top of a white square canvas of the size MuSViT was pre-trained on.
-    Returns a (3, canvas_size, canvas_size) tensor in [0, 1], without normalization (as documented).
+    The stave resized to the full canvas width and `stave_height`, as in the MuSViT documentation.
+    Returns a (3, stave_height, canvas_size) tensor in [0, 1], without normalization (as documented).
     """
-    stave = image.convert("RGB").resize((canvas_size, stave_height))
-    canvas = Image.new("RGB", (canvas_size, canvas_size), color=(255, 255, 255))
-    canvas.paste(stave, (0, 0))
-    return to_tensor(canvas)
+    return to_tensor(image.convert("RGB").resize((canvas_size, stave_height)))
+
+
+def stave_canvas(bands: torch.Tensor, canvas_size: int = 1024) -> torch.Tensor:
+    """
+    MuSViT's documented stave input: the stave bands (B, 3, stave_height, canvas_size) pasted at the top
+    of a white square canvas of the size MuSViT was pre-trained on -> (B, 3, canvas_size, canvas_size).
+    Built on the bands' device, so that only the bands travel from the CPU.
+    """
+    canvas = bands.new_ones(bands.shape[0], 3, canvas_size, canvas_size)  # white, as to_tensor maps 255 to 1.0
+    canvas[:, :, :bands.shape[2]] = bands
+    return canvas
+
+
+class StaveBands(torch.utils.data.Dataset):
+    """Decodes and resizes stave images in DataLoader workers, so that the GPU does not wait for them."""
+    def __init__(self, images: list[bytes], canvas_size: int, stave_height: int):
+        self.images = images
+        self.canvas_size = canvas_size
+        self.stave_height = stave_height
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, idx: int) -> tuple[int, torch.Tensor | str]:
+        """The index with the stave band, or with the error message if the image cannot be decoded."""
+        try:
+            return idx, prepare_stave_band(Image.open(io.BytesIO(self.images[idx])), self.canvas_size, self.stave_height)
+        except OSError as e:
+            return idx, str(e)
+
+
+def keep_as_list(batch: list) -> list:
+    return batch
 
 
 def load_musvit(model_name: str = "PRAIG/musvit", device: str = "cuda", token: str | None = None):
@@ -133,6 +162,8 @@ def extract_and_cache(
     stave_height: int = 64,
     precision: str = "float16",  # 'float16' or 'float32'
     batch_size: int = 8,
+    num_workers: int = 4,
+    tf32: bool = False,
     device: str | None = None,
     token: str | None = None,
     skip_existing: bool = True,
@@ -176,30 +207,40 @@ def extract_and_cache(
         )
     patch_rows = stave_height // patch_size
     dtype = torch.float16 if precision == "float16" else torch.float32
+    if tf32:
+        # Faster matrix multiplications on Ampere+ GPUs, with a 10-bit mantissa like the FP16 storage
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     saved_count = 0
     failed: list[Path] = []
-    items = list(todo.items())
+    paths_todo = list(todo)
+    loader = torch.utils.data.DataLoader(
+        StaveBands(list(todo.values()), canvas_size, stave_height),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=keep_as_list,
+    )
 
     print(
         f"Extracting features of staves resized to {canvas_size}x{stave_height} on a {canvas_size}x{canvas_size} "
         f"canvas ({patch_rows} patch rows), precision='{precision}'..."
     )
-    for start in tqdm(range(0, len(items), batch_size), desc="Extracting features"):
-        images, paths = [], []
-        for feat_path, image_bytes in items[start:start + batch_size]:
-            try:
-                images.append(prepare_stave(Image.open(io.BytesIO(image_bytes)), canvas_size, stave_height))
-            except OSError as e:
-                print(f"\n[Warning] Could not decode the image for '{feat_path}': {e}")
-                failed.append(feat_path)
+    for batch in tqdm(loader, desc="Extracting features"):
+        bands, paths = [], []
+        for idx, band in batch:
+            if isinstance(band, str):
+                print(f"\n[Warning] Could not decode the image for '{paths_todo[idx]}': {band}")
+                failed.append(paths_todo[idx])
                 continue
-            paths.append(feat_path)
-        if not images:
+            bands.append(band)
+            paths.append(paths_todo[idx])
+        if not bands:
             continue
 
         with torch.inference_mode():
-            last_hidden_state = model(torch.stack(images).to(device)).last_hidden_state
+            canvas = stave_canvas(torch.stack(bands).to(device, non_blocking=True), canvas_size)
+            last_hidden_state = model(canvas).last_hidden_state
             grids = stave_patch_grid(last_hidden_state, patch_rows).to(dtype=dtype, device="cpu")
 
         for feat_path, feat in zip(paths, grids, strict=True):
@@ -245,6 +286,8 @@ def main():
     )
     parser.add_argument("--precision", type=str, default="float16", choices=["float16", "float32"], help="Tensor precision.")
     parser.add_argument("--batch-size", type=int, default=8, help="Images per MuSViT forward pass.")
+    parser.add_argument("--num-workers", type=int, default=4, help="Workers decoding and resizing images ahead of the GPU.")
+    parser.add_argument("--tf32", action="store_true", help="Use TF32 matrix multiplications on Ampere+ GPUs: several times faster, slightly less precise (10-bit mantissa, like the FP16 storage).")
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda' or 'cpu'). Auto-detected if not given.")
     parser.add_argument("--token", type=str, default=None, help="HuggingFace token if required.")
     parser.add_argument("--no-skip", action="store_true", help="Force re-extraction of existing cached files.")
@@ -262,6 +305,8 @@ def main():
         stave_height=args.stave_height,
         precision=args.precision,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        tf32=args.tf32,
         device=args.device,
         token=args.token,
         skip_existing=not args.no_skip,

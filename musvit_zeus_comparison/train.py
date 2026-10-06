@@ -23,28 +23,32 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data import DataLoader
 
 try:
     from musvit_zeus_comparison.zeus.evaluation.symbol_error_rate import symbol_error_rate
     from musvit_zeus_comparison.dataset import (
+        LengthBucketBatchSampler,
         StaveCollate,
         StaveOMRDataset,
         TokenVocabulary,
         discover_datasets,
         feature_variant,
         load_split,
+        missing_feature_files,
     )
     from musvit_zeus_comparison.models import CombinedOMRModel
 except ImportError:
     from zeus.evaluation.symbol_error_rate import symbol_error_rate
     from dataset import (
+        LengthBucketBatchSampler,
         StaveCollate,
         StaveOMRDataset,
         TokenVocabulary,
         discover_datasets,
         feature_variant,
         load_split,
+        missing_feature_files,
     )
     from models import CombinedOMRModel
 
@@ -92,13 +96,38 @@ def learning_rate_at(epoch: int, args: argparse.Namespace) -> float:
 
 
 def make_loader(dataset: StaveOMRDataset, args: argparse.Namespace, shuffle: bool) -> DataLoader:
+    """
+    Batches samples of similar transcription length (see LengthBucketBatchSampler).
+    Unshuffled (evaluation) loaders iterate in length order, not dataset order.
+    """
     vocab = dataset.vocab
     return DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        shuffle=shuffle,
+        batch_sampler=LengthBucketBatchSampler(
+            dataset.target_lengths(), args.batch_size, shuffle=shuffle, pool_batches=args.length_bucket_batches
+        ),
         collate_fn=StaveCollate(pad_idx=vocab.pad_idx, bos_idx=vocab.bos_idx, eos_idx=vocab.eos_idx),
         num_workers=args.num_workers,
+        # Workers live across epochs instead of being re-forked (with the whole dataset) for every pass
+        persistent_workers=args.num_workers > 0,
+        # Page-locked batches can be copied to the GPU asynchronously
+        pin_memory=torch.cuda.is_available(),
+        # The worker seed comes from this generator instead of the global RNG. Persistent workers draw it only
+        # when first started, which would otherwise shift the shuffling of a resumed run against an uninterrupted one.
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+
+
+def to_device(
+    batch: tuple[torch.Tensor, ...], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Moves a collated batch to the device. Input lengths stay on the CPU, where sequence packing needs them."""
+    inputs, lengths, input_seqs, targets = batch
+    return (
+        inputs.to(device, non_blocking=True),
+        lengths,
+        input_seqs.to(device, non_blocking=True),
+        targets.to(device, non_blocking=True),
     )
 
 
@@ -111,36 +140,41 @@ def evaluate_teacher_forced(
 ) -> tuple[float, float]:
     """Per-token loss and token accuracy (%) under teacher forcing."""
     model.eval()
-    loss_sum, correct, total = 0.0, 0, 0
+    # Accumulated on the device, so that the CPU does not wait for the GPU after every batch
+    loss_sum = torch.zeros((), device=device)
+    correct = torch.zeros((), dtype=torch.long, device=device)
+    total = torch.zeros((), dtype=torch.long, device=device)
     with torch.no_grad():
-        for inputs, lengths, input_seqs, targets in loader:
-            inputs, lengths = inputs.to(device), lengths.to(device)
-            input_seqs, targets = input_seqs.to(device), targets.to(device)
-
+        for batch in loader:
+            inputs, lengths, input_seqs, targets = to_device(batch, device)
             logits = model(inputs, input_seqs, lengths)
             mask = targets != vocab.pad_idx
-            n_tokens = int(mask.sum())
-            loss_sum += criterion(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1)).item() * n_tokens
-            correct += int(((logits.argmax(dim=-1) == targets) & mask).sum())
+            n_tokens = mask.sum()
+            loss_sum += criterion(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1)) * n_tokens
+            correct += ((logits.argmax(dim=-1) == targets) & mask).sum()
             total += n_tokens
-    return loss_sum / max(1, total), 100.0 * correct / max(1, total)
+    total_tokens = max(1, int(total))
+    return loss_sum.item() / total_tokens, 100.0 * int(correct) / total_tokens
 
 
 def predict_lmx(model: nn.Module, loader: DataLoader, vocab: TokenVocabulary, device: torch.device) -> list[str]:
-    """Greedy autoregressive predictions as LMX strings, in the (unshuffled) order of the loader's dataset."""
-    assert isinstance(loader.sampler, SequentialSampler), "Predictions must come in dataset order."
+    """Greedy autoregressive predictions as LMX strings, in the order of the loader's dataset."""
+    batch_sampler = loader.batch_sampler
+    assert isinstance(batch_sampler, LengthBucketBatchSampler) and not batch_sampler.shuffle, \
+        "Predictions can only be put back in dataset order with a deterministic batch order."
     model.eval()
-    pred_lmx_list: list[str] = []
-    for inputs, lengths, _, _ in loader:
-        generated = model.generate(inputs.to(device), lengths.to(device))
-        for pred_seq in generated.cpu().tolist():
+    pred_lmx_list: list[str] = [""] * len(loader.dataset)
+    for batch, indices in zip(loader, batch_sampler, strict=True):
+        inputs, lengths, _, _ = to_device(batch, device)
+        generated = model.generate(inputs, lengths)
+        for idx, pred_seq in zip(indices, generated.cpu().tolist(), strict=True):
             clean_pred = []
             for t in pred_seq:
                 if t == vocab.eos_idx:
                     break
                 if t not in (vocab.pad_idx, vocab.bos_idx):
                     clean_pred.append(t)
-            pred_lmx_list.append(" ".join(vocab.decode(clean_pred)))
+            pred_lmx_list[idx] = " ".join(vocab.decode(clean_pred))
     return pred_lmx_list
 
 
@@ -258,11 +292,12 @@ def train_single_model(
 
     criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
 
-    # Optimizer matching TensorFlow Zeus specification
+    # Optimizer matching TensorFlow Zeus specification; the fused CUDA kernel updates all parameters at once
+    fused = device.type == "cuda"
     if args.optimizer == "adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, eps=1e-7)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, eps=1e-7, fused=fused)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, fused=fused)
 
     # The checkpoint is selected by validation SER; by validation loss only when SER is never evaluated
     select_by = "ser" if args.evaluation_each > 0 else "val_loss"
@@ -302,12 +337,12 @@ def train_single_model(
             group["lr"] = lr
 
         model.train()
-        train_loss_sum = 0.0
-        train_tokens = 0
+        # Accumulated on the device, so that the CPU does not wait for the GPU after every batch
+        train_loss_sum = torch.zeros((), device=device)
+        train_tokens = torch.zeros((), dtype=torch.long, device=device)
 
-        for inputs, lengths, input_seqs, targets in train_loader:
-            inputs, lengths = inputs.to(device), lengths.to(device)
-            input_seqs, targets = input_seqs.to(device), targets.to(device)
+        for batch in train_loader:
+            inputs, lengths, input_seqs, targets = to_device(batch, device)
 
             optimizer.zero_grad()
             logits = model(inputs, input_seqs, lengths)  # (B, L, V)
@@ -317,11 +352,11 @@ def train_single_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            n_tokens = int((targets != vocab.pad_idx).sum())
-            train_loss_sum += loss.item() * n_tokens
+            n_tokens = (targets != vocab.pad_idx).sum()
+            train_loss_sum += loss.detach() * n_tokens
             train_tokens += n_tokens
 
-        train_loss = train_loss_sum / max(1, train_tokens)
+        train_loss = train_loss_sum.item() / max(1, int(train_tokens))
         val_loss, token_acc = evaluate_teacher_forced(model, val_loader, criterion, vocab, device)
 
         # Periodic Symbol Error Rate (SER) evaluation matching Zeus
@@ -570,18 +605,23 @@ def main():
     )
     dataset_spec_help = (
         "Dataset(s) whose predefined '{}' split to use: names of subfolders of --dataset-dir, "
-        "dataset folders, or .pickle files (default: --datasets)."
+        "dataset folders, or .pickle files (default: {})."
     )
-    parser.add_argument("--train", type=str, nargs="+", default=None, help=dataset_spec_help.format("train"))
-    parser.add_argument("--dev", "--val", dest="dev", type=str, nargs="+", default=None, help=dataset_spec_help.format("dev"))
+    parser.add_argument("--train", type=str, nargs="+", default=None, help=dataset_spec_help.format("train", "--datasets"))
+    parser.add_argument(
+        "--dev", "--val", dest="dev", type=str, nargs="+", default=None,
+        help=dataset_spec_help.format("dev", "--datasets, or the --train datasets if --datasets is not given"),
+    )
     parser.add_argument(
         "--test", type=str, nargs="*", default=None,
-        help=dataset_spec_help.format("test") + " Pass --test without values to skip testing.",
+        help=dataset_spec_help.format("test", "--datasets, or the --train datasets if --datasets is not given")
+             + " Pass --test without values to skip testing.",
     )
     parser.add_argument("--feature-cache-dir", type=str, default="feature_cache", help="Directory of pre-extracted MuSViT features.")
     parser.add_argument("--feature-stave-height", type=int, default=64, help="Stave height the MuSViT features were extracted with (extract_features.py --stave-height).")
     parser.add_argument("--feature-layout", type=str, default="columns", choices=["columns", "raster"], help="Sequence made of the MuSViT patch grid: one timestep per patch column with its rows concatenated ('columns'), or the row-major patch sequence of the MuSViT documentation ('raster').")
     parser.add_argument("--feature-precision", type=str, default="float16", choices=["float16", "float32"], help="Precision the MuSViT features were extracted with.")
+    parser.add_argument("--preload-features", action="store_true", help="Read all MuSViT feature files into RAM once (~0.4 MB per stave at height 64) instead of from disk in every epoch; helps on slow (e.g. network) filesystems.")
     parser.add_argument("--output-dir", type=str, default="experiment_results", help="Directory to save logs, checkpoints and tables.")
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs (Zeus default: 400-500).")
     parser.add_argument("--batch-size", type=int, default=32, help="Training batch size (Zeus default: 32 or 64).")
@@ -596,6 +636,7 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate (default: 0.2 matching solo26).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
+    parser.add_argument("--length-bucket-batches", type=int, default=50, help="Training batches are formed from pools of this many batches sorted by transcription length, so that a batch holds similar lengths and the decoder wastes few steps on padding; 1 gives plain random batches.")
     parser.add_argument("--evaluation-from", type=int, default=1, help="Start evaluation with this epoch onward (matches Zeus).")
     parser.add_argument("--evaluation-each", "--eval-interval", dest="evaluation_each", type=int, default=10, help="Run validation SER evaluation every N epochs (matches Zeus). The best checkpoint is selected by it; 0 selects by validation loss instead.")
     parser.add_argument("--resume", type=str, default=None, help="Resume training. Pass 'auto' or path to .pt checkpoint.")
@@ -603,6 +644,7 @@ def main():
     parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate the best checkpoint (or the one given by --resume).")
     parser.add_argument("--max-gen-length", type=int, default=None, help="Max length for autoregressive decoding (default: 1.2x the longest training sequence).")
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda' or 'cpu'). Auto-detected if not specified.")
+    parser.add_argument("--no-tf32", action="store_true", help="Compute matrix multiplications in full FP32 instead of TF32 (TF32 runs on the tensor cores of Ampere and newer GPUs).")
 
     args = parser.parse_args()
     if args.model == "compare" and args.resume and args.resume.lower() != "auto":
@@ -611,14 +653,21 @@ def main():
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Active Device: {device}")
 
+    # TF32 tensor cores for matrix multiplications (decoder LSTM cell, attention, projections); PyTorch already
+    # uses TF32 for convolutions and cuDNN LSTMs by default. No effect on the CPU or pre-Ampere GPUs.
+    torch.backends.cuda.matmul.allow_tf32 = not args.no_tf32
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Select datasets for each split and load their predefined splits
-    default_datasets = args.datasets or discover_datasets(args.dataset_dir)
-    train_specs = args.train or default_datasets
-    dev_specs = args.dev or default_datasets
-    test_specs = args.test if args.test is not None else default_datasets
+    models_to_run = ["zeus", "musvit"] if args.model == "compare" else [args.model]
+
+    # 1. Select datasets for each split and load their predefined splits.
+    # Without --datasets, dev and test follow the training datasets rather than everything in --dataset-dir.
+    train_specs = args.train or args.datasets or discover_datasets(args.dataset_dir)
+    default_eval_specs = args.datasets or train_specs
+    dev_specs = args.dev or default_eval_specs
+    test_specs = args.test if args.test is not None else default_eval_specs
 
     if not train_specs:
         raise FileNotFoundError(
@@ -628,12 +677,14 @@ def main():
             f"  python -m musvit_zeus_comparison.zeus pickle {args.dataset_dir}/<name>/samples.*.txt"
         )
 
+    # The MuSViT run alone reads pre-extracted features and never needs the images
+    keep_images = "zeus" in models_to_run
     print("Loading training datasets...")
-    train_samples = load_split(train_specs, args.dataset_dir, "train")
+    train_samples = load_split(train_specs, args.dataset_dir, "train", keep_images)
     print("Loading validation datasets...")
-    val_samples = load_split(dev_specs, args.dataset_dir, "dev")
+    val_samples = load_split(dev_specs, args.dataset_dir, "dev", keep_images)
     print("Loading test datasets...")
-    test_samples = load_split(test_specs, args.dataset_dir, "test") if test_specs else {}
+    test_samples = load_split(test_specs, args.dataset_dir, "test", keep_images) if test_specs else {}
 
     selection = {"train": list(train_samples), "dev": list(val_samples), "test": list(test_samples)}
     for split, names in selection.items():
@@ -656,8 +707,19 @@ def main():
         if too_long:
             print(f"Warning: {too_long:,} {split} sample(s) are longer than the max generation length and will be truncated.")
 
-    models_to_run = ["zeus", "musvit"] if args.model == "compare" else [args.model]
-    results = []
+    variant = feature_variant(args.feature_stave_height, args.feature_precision)
+    if "musvit" in models_to_run:
+        # Fail now rather than hours into training (or after the whole Zeus run, with --model compare)
+        missing = [
+            path
+            for samples in (train_samples, val_samples, test_samples)
+            for path in missing_feature_files(samples, args.feature_cache_dir, variant)
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing):,} MuSViT feature file(s) are missing, e.g. '{missing[0]}'. Run extract_features.py "
+                f"with --stave-height {args.feature_stave_height} --precision {args.feature_precision} first."
+            )
 
     for m in models_to_run:
         checkpoint_path = resolve_checkpoint(args, m)
@@ -681,8 +743,9 @@ def main():
             vocab=vocab,
             mode=m,
             feature_cache_dir=args.feature_cache_dir,
-            feature_variant=feature_variant(args.feature_stave_height, args.feature_precision),
+            feature_variant=variant,
             feature_layout=args.feature_layout,
+            preload_features=args.preload_features,
             image_height=args.image_height,
             max_image_width=args.max_image_width,
         )
@@ -690,16 +753,7 @@ def main():
         val_ds = StaveOMRDataset(val_samples, **dataset_kwargs)
         test_ds = StaveOMRDataset(test_samples, **dataset_kwargs) if test_samples else None
 
-        musvit_dim = 768
-        if m == "musvit":
-            # Fail now rather than hours into training
-            missing = [p for ds in (train_ds, val_ds, test_ds) if ds is not None for p in ds.missing_features()]
-            if missing:
-                raise FileNotFoundError(
-                    f"{len(missing):,} MuSViT feature file(s) are missing, e.g. '{missing[0]}'. Run extract_features.py "
-                    f"with --stave-height {args.feature_stave_height} --precision {args.feature_precision} first."
-                )
-            musvit_dim = train_ds[0][0].shape[-1]
+        musvit_dim = train_ds[0][0].shape[-1] if m == "musvit" else 768
 
         res = train_single_model(
             model_type=m,
@@ -713,10 +767,9 @@ def main():
             musvit_dim=musvit_dim,
         )
         res["datasets"] = selection
-        results.append(res)
 
-    # 3. Export findings into table
-    export_results_table(results, args.output_dir)
+        # 3. Export after every run, so that a finished run is never lost to a failure of the next one
+        export_results_table([res], args.output_dir)
 
 
 if __name__ == "__main__":
