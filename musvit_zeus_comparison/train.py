@@ -2,7 +2,8 @@
 Training and Comparison Script: Run 1 (Zeus Baseline) vs Run 2 (MuSViT + Zeus).
 
 Follows the Zeus repository workflow:
-- Ingests datasets from Zeus pickled slices (ZeusDatasetSample).
+- Ingests the predefined splits of the selected datasets from Zeus pickled slices (ZeusDatasetSample).
+  Each split (train / dev / test) can combine any datasets found in the dataset directory.
 - Run 1 (Zeus Baseline): CNN-BiLSTM Encoder + Zeus Bahdanau Attention Decoder (trained from scratch).
 - Run 2 (MuSViT + Zeus): Pre-trained MuSViT Vision Transformer Feature Extractor + Zeus Decoder.
 - Evaluation: Symbol Error Rate (SER) computed directly with zeus.evaluation.symbol_error_rate.
@@ -14,36 +15,44 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SequentialSampler
 
 try:
-    from musvit_zeus_comparison.zeus.data.zeus_dataset import ZeusDatasetSample
     from musvit_zeus_comparison.zeus.evaluation.symbol_error_rate import symbol_error_rate
     from musvit_zeus_comparison.dataset import (
         StaveCollate,
         StaveOMRDataset,
         TokenVocabulary,
-        load_zeus_pickles,
+        discover_datasets,
+        feature_variant,
+        load_split,
     )
     from musvit_zeus_comparison.models import CombinedOMRModel
 except ImportError:
-    from zeus.data.zeus_dataset import ZeusDatasetSample
     from zeus.evaluation.symbol_error_rate import symbol_error_rate
     from dataset import (
         StaveCollate,
         StaveOMRDataset,
         TokenVocabulary,
-        load_zeus_pickles,
+        discover_datasets,
+        feature_variant,
+        load_split,
     )
     from models import CombinedOMRModel
+
+
+RUN_INFO = {
+    "zeus": {"model": "Zeus Baseline (Run 1)", "encoder": "CNN-BiLSTM"},
+    "musvit": {"model": "MuSViT + Zeus (Run 2)", "encoder": "MuSViT + Adapter"},
+}
 
 
 def set_seed(seed: int = 42):
@@ -54,36 +63,149 @@ def set_seed(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
 
 
-def evaluate_ser(
+def get_rng_state() -> dict:
+    state = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def set_rng_state(state: dict):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available() and len(state["cuda"]) == torch.cuda.device_count():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def learning_rate_at(epoch: int, args: argparse.Namespace) -> float:
+    """
+    Learning rate of a (1-based) epoch. With 'cos' decay, it follows a cosine from the
+    initial rate down towards 1% of it over all epochs. Being a pure function of the epoch,
+    it stays correct when training resumes, even with a changed --epochs.
+    """
+    if args.lr_decay != "cos":
+        return args.learning_rate
+    min_lr = args.learning_rate * 0.01
+    progress = (epoch - 1) / max(1, args.epochs)
+    return min_lr + (args.learning_rate - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def make_loader(dataset: StaveOMRDataset, args: argparse.Namespace, shuffle: bool) -> DataLoader:
+    vocab = dataset.vocab
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        collate_fn=StaveCollate(pad_idx=vocab.pad_idx, bos_idx=vocab.bos_idx, eos_idx=vocab.eos_idx),
+        num_workers=args.num_workers,
+    )
+
+
+def evaluate_teacher_forced(
     model: nn.Module,
     loader: DataLoader,
+    criterion: nn.Module,
     vocab: TokenVocabulary,
-    max_length: int,
     device: torch.device,
-) -> float:
-    """Computes Symbol Error Rate (SER) using greedy autoregressive generation and Zeus metric."""
+) -> tuple[float, float]:
+    """Per-token loss and token accuracy (%) under teacher forcing."""
     model.eval()
-    gold_lmx_list: list[str] = []
-    pred_lmx_list: list[str] = []
-
+    loss_sum, correct, total = 0.0, 0, 0
     with torch.no_grad():
-        for inputs, _, targets in loader:
-            inputs = inputs.to(device)
-            generated = model.generate(inputs, max_length=max_length)
+        for inputs, lengths, input_seqs, targets in loader:
+            inputs, lengths = inputs.to(device), lengths.to(device)
+            input_seqs, targets = input_seqs.to(device), targets.to(device)
 
-            for pred_seq, gold_seq in zip(generated.cpu().tolist(), targets.cpu().tolist()):
-                clean_gold = [t for t in gold_seq if t not in (vocab.pad_idx, vocab.eos_idx, vocab.bos_idx)]
-                clean_pred = []
-                for t in pred_seq:
-                    if t == vocab.eos_idx:
-                        break
-                    if t not in (vocab.pad_idx, vocab.bos_idx):
-                        clean_pred.append(t)
+            logits = model(inputs, input_seqs, lengths)
+            mask = targets != vocab.pad_idx
+            n_tokens = int(mask.sum())
+            loss_sum += criterion(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1)).item() * n_tokens
+            correct += int(((logits.argmax(dim=-1) == targets) & mask).sum())
+            total += n_tokens
+    return loss_sum / max(1, total), 100.0 * correct / max(1, total)
 
-                gold_lmx_list.append(" ".join(vocab.decode(clean_gold)))
-                pred_lmx_list.append(" ".join(vocab.decode(clean_pred)))
 
-    return symbol_error_rate(gold_lmx_list, pred_lmx_list)
+def predict_lmx(model: nn.Module, loader: DataLoader, vocab: TokenVocabulary, device: torch.device) -> list[str]:
+    """Greedy autoregressive predictions as LMX strings, in the (unshuffled) order of the loader's dataset."""
+    assert isinstance(loader.sampler, SequentialSampler), "Predictions must come in dataset order."
+    model.eval()
+    pred_lmx_list: list[str] = []
+    for inputs, lengths, _, _ in loader:
+        generated = model.generate(inputs.to(device), lengths.to(device))
+        for pred_seq in generated.cpu().tolist():
+            clean_pred = []
+            for t in pred_seq:
+                if t == vocab.eos_idx:
+                    break
+                if t not in (vocab.pad_idx, vocab.bos_idx):
+                    clean_pred.append(t)
+            pred_lmx_list.append(" ".join(vocab.decode(clean_pred)))
+    return pred_lmx_list
+
+
+def evaluate_ser(model: nn.Module, loader: DataLoader, vocab: TokenVocabulary, device: torch.device) -> float:
+    """Symbol Error Rate (SER) of greedy decoding against the gold LMX, using the Zeus metric."""
+    return symbol_error_rate(loader.dataset.gold_lmx(), predict_lmx(model, loader, vocab, device))
+
+
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    vocab: TokenVocabulary,
+    epoch: int,
+    best: dict | None,
+    history: list[dict],
+    train_time_sec: float,
+):
+    """Saves everything needed to evaluate the model or to resume its training exactly."""
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "vocab": vocab.to_dict(),
+            "epoch": epoch,
+            "best": best,
+            "history": history,
+            "train_time_sec": train_time_sec,
+            "rng": get_rng_state(),
+        },
+        path,
+    )
+
+
+def load_checkpoint(path: Path) -> dict:
+    # weights_only=False: own checkpoints also hold optimizer and RNG state (numpy arrays, tuples)
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def resolve_checkpoint(args: argparse.Namespace, model_type: str) -> Path | None:
+    """The checkpoint to start from: an explicit --resume path, the best one for --eval-only, or the latest one."""
+    output_dir = Path(args.output_dir)
+    latest_path = output_dir / f"{model_type}_latest.pt"
+    best_path = output_dir / f"{model_type}_best.pt"
+
+    if args.resume and args.resume.lower() != "auto":
+        path = Path(args.resume)
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint to resume from not found: '{path}'")
+        return path
+
+    if args.eval_only:
+        if not best_path.is_file():
+            raise FileNotFoundError(
+                f"--eval-only needs a trained model, but '{best_path}' does not exist. "
+                f"Pass --resume <checkpoint.pt> to evaluate a different checkpoint."
+            )
+        return best_path
+
+    if args.resume:
+        for candidate in (latest_path, best_path):
+            if candidate.is_file():
+                return candidate
+        print(f"No checkpoint of '{model_type}' found in '{output_dir}'; training from scratch.")
+    return None
 
 
 def train_single_model(
@@ -94,36 +216,31 @@ def train_single_model(
     args: argparse.Namespace,
     device: torch.device,
     test_dataset: StaveOMRDataset | None = None,
-) -> dict[str, float | int | str]:
+    checkpoint: dict | None = None,
+    musvit_dim: int = 768,
+) -> dict:
     """Trains either Run 1 ('zeus') or Run 2 ('musvit') and returns metrics summary."""
-    print(f"\n=======================================================")
-    print(f" Starting Training: {'Run 1: Zeus Baseline' if model_type == 'zeus' else 'Run 2: MuSViT + Zeus'}")
-    print(f"=======================================================")
+    print("\n=======================================================")
+    print(f" Starting Training: {RUN_INFO[model_type]['model']}")
+    print("=======================================================")
 
-    collate_fn = StaveCollate(pad_idx=vocab.pad_idx, bos_idx=vocab.bos_idx, eos_idx=vocab.eos_idx)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=args.num_workers,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=args.num_workers,
-    )
+    # Every run starts from the same seed, also when several runs share one process (--model compare)
+    set_seed(args.seed)
+
+    train_loader = make_loader(train_dataset, args, shuffle=True)
+    val_loader = make_loader(val_dataset, args, shuffle=False)
 
     model = CombinedOMRModel(
         encoder_type=model_type,
         vocab_size=len(vocab),
         dim=args.dim,
-        timestep_width=getattr(args, "timestep_width", 16),
+        timestep_width=args.timestep_width,
+        input_height=args.image_height,
+        musvit_dim=musvit_dim,
         bos_idx=vocab.bos_idx,
         eos_idx=vocab.eos_idx,
         pad_idx=vocab.pad_idx,
+        max_length=args.max_gen_length,
         dropout=args.dropout,
     ).to(device)
 
@@ -133,253 +250,185 @@ def train_single_model(
     print(f"Parameters: Encoder: {enc_params:,} | Decoder: {dec_params:,} | Total: {total_params:,}")
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Checkpoint resuming
-    start_epoch = 1
-    best_val_loss = float("inf")
-    best_ser = float("inf")
-
-    resume_target = None
-    if getattr(args, "resume", None):
-        if str(args.resume).lower() == "auto":
-            for cand in [output_dir / f"{model_type}_latest.pt", output_dir / f"{model_type}_best.pt"]:
-                if cand.exists():
-                    resume_target = cand
-                    break
-        else:
-            cand = Path(args.resume)
-            if cand.exists():
-                resume_target = cand
-
-    if resume_target is not None:
-        print(f"Loading checkpoint from: {resume_target}")
-        checkpoint = torch.load(resume_target, map_location=device)
-        state_dict = checkpoint.get("model", checkpoint)
-        model.load_state_dict(state_dict)
-        if isinstance(checkpoint, dict):
-            start_epoch = checkpoint.get("epoch", 0) + 1
-            best_val_loss = checkpoint.get("val_loss", float("inf"))
-            best_ser = checkpoint.get("ser", float("inf"))
-        print(f"Resumed successfully. Training will continue from epoch {start_epoch:02d}/{args.epochs:02d}.")
-
-    # Fast evaluation-only mode if requested
-    if getattr(args, "eval_only", False):
-        print(f"\nRunning standalone validation SER evaluation for {model_type}...")
-        val_ser = evaluate_ser(model, val_loader, vocab, max_length=args.max_gen_length, device=device)
-        print(f"Validation SER: {val_ser:.2f}%")
-
-        test_ser = None
-        if test_dataset is not None and len(test_dataset) > 0:
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=collate_fn,
-                num_workers=args.num_workers,
-            )
-            test_ser = evaluate_ser(model, test_loader, vocab, max_length=args.max_gen_length, device=device)
-            print(f"Test SER: {test_ser:.2f}%")
-
-        return {
-            "model": "Zeus Baseline (Run 1)" if model_type == "zeus" else "MuSViT + Zeus (Run 2)",
-            "model_type": model_type,
-            "encoder": "CNN-BiLSTM" if model_type == "zeus" else "MuSViT + Adapter",
-            "enc_params": enc_params,
-            "dec_params": dec_params,
-            "total_params": total_params,
-            "train_loss": 0.0,
-            "val_loss": round(best_val_loss, 4),
-            "token_acc": 0.0,
-            "ser": round(val_ser, 2),
-            "test_ser": round(test_ser, 2) if test_ser is not None else None,
-            "total_time_sec": 0.0,
-            "avg_epoch_sec": 0.0,
-            "history": [],
-        }
+    latest_path = output_dir / f"{model_type}_latest.pt"
+    best_path = output_dir / f"{model_type}_best.pt"
+    snapshots_dir = output_dir / "snapshots"
+    if args.save_snapshots:
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
 
     criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
 
     # Optimizer matching TensorFlow Zeus specification
-    opt_name = getattr(args, "optimizer", "adam").lower()
-    if opt_name == "adam":
+    if args.optimizer == "adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, eps=1e-7)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    # Learning rate schedule
-    if args.lr_decay == "cos":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.learning_rate * 0.01)
-    else:
-        scheduler = None
+    # The checkpoint is selected by validation SER; by validation loss only when SER is never evaluated
+    select_by = "ser" if args.evaluation_each > 0 else "val_loss"
 
-    for _ in range(1, start_epoch):
-        if scheduler:
-            scheduler.step()
+    start_epoch = 1
+    best: dict | None = None
+    history: list[dict] = []
+    prior_train_time = 0.0
+
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint["model"])
+        start_epoch = checkpoint.get("epoch", 0) + 1
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            best = checkpoint["best"]
+            history = checkpoint["history"]
+            prior_train_time = checkpoint["train_time_sec"]
+            set_rng_state(checkpoint["rng"])
+        else:
+            print(
+                "Warning: this checkpoint predates optimizer-state saving. Adam moments restart from zero, "
+                "and the best-so-far record is unknown, so the next evaluated epoch becomes the best checkpoint."
+            )
+        print(f"Resumed from epoch {start_epoch - 1}.")
+
+    if args.eval_only:
+        start_epoch = args.epochs + 1  # skip the training loop
+    elif start_epoch > args.epochs:
+        print(f"Model already reached epoch {start_epoch - 1} >= requested target epochs {args.epochs}. Skipping training loop.")
 
     start_time = time.time()
-    history = []
-    snapshots_dir = output_dir / "snapshots"
-    if getattr(args, "save_snapshots", False):
-        snapshots_dir.mkdir(parents=True, exist_ok=True)
 
-    if start_epoch > args.epochs:
-        print(f"Model already reached epoch {start_epoch - 1} >= requested target epochs {args.epochs}. Skipping training loop.")
-    else:
-        for epoch in range(start_epoch, args.epochs + 1):
-            epoch_start = time.time()
-            model.train()
-            train_loss = 0.0
-            train_tokens = 0
+    for epoch in range(start_epoch, args.epochs + 1):
+        epoch_start = time.time()
+        lr = learning_rate_at(epoch, args)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
 
-            for inputs, input_seqs, targets in train_loader:
-                inputs = inputs.to(device)
-                input_seqs = input_seqs.to(device)
-                targets = targets.to(device)
+        model.train()
+        train_loss_sum = 0.0
+        train_tokens = 0
 
-                optimizer.zero_grad()
-                logits = model(inputs, input_seqs)  # (B, L, V)
+        for inputs, lengths, input_seqs, targets in train_loader:
+            inputs, lengths = inputs.to(device), lengths.to(device)
+            input_seqs, targets = input_seqs.to(device), targets.to(device)
 
-                loss = criterion(logits.view(-1, len(vocab)), targets.view(-1))
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+            optimizer.zero_grad()
+            logits = model(inputs, input_seqs, lengths)  # (B, L, V)
 
-                train_loss += loss.item() * targets.size(0)
-                train_tokens += (targets != vocab.pad_idx).sum().item()
+            loss = criterion(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-            if scheduler:
-                scheduler.step()
-            train_loss /= len(train_dataset)
+            n_tokens = int((targets != vocab.pad_idx).sum())
+            train_loss_sum += loss.item() * n_tokens
+            train_tokens += n_tokens
 
-            # Validation phase
-            model.eval()
-            val_loss = 0.0
-            val_correct = 0
-            val_total = 0
+        train_loss = train_loss_sum / max(1, train_tokens)
+        val_loss, token_acc = evaluate_teacher_forced(model, val_loader, criterion, vocab, device)
 
-            with torch.no_grad():
-                for inputs, input_seqs, targets in val_loader:
-                    inputs = inputs.to(device)
-                    input_seqs = input_seqs.to(device)
-                    targets = targets.to(device)
-
-                    logits = model(inputs, input_seqs)
-                    loss = criterion(logits.view(-1, len(vocab)), targets.view(-1))
-                    val_loss += loss.item() * targets.size(0)
-
-                    preds = torch.argmax(logits, dim=-1)
-                    mask = (targets != vocab.pad_idx)
-                    val_correct += ((preds == targets) & mask).sum().item()
-                    val_total += mask.sum().item()
-
-            val_loss /= len(val_dataset)
-            token_acc = (val_correct / max(1, val_total)) * 100.0
-            epoch_sec = time.time() - epoch_start
-
-            # Periodic Symbol Error Rate (SER) evaluation matching Zeus
-            eval_each = getattr(args, "evaluation_each", 10)
-            eval_from = getattr(args, "evaluation_from", 1)
-            should_eval_ser = (eval_each > 0 and epoch >= eval_from and (epoch % eval_each == 0 or epoch == args.epochs))
-
-            current_ser = None
-            if should_eval_ser:
-                current_ser = evaluate_ser(model, val_loader, vocab, max_length=args.max_gen_length, device=device)
-                if current_ser < best_ser:
-                    best_ser = current_ser
-                    torch.save(
-                        {"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "ser": current_ser, "vocab": vocab.token2id},
-                        output_dir / f"{model_type}_best.pt",
-                    )
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                if not should_eval_ser:
-                    torch.save(
-                        {"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "ser": best_ser, "vocab": vocab.token2id},
-                        output_dir / f"{model_type}_best.pt",
-                    )
-
-            torch.save(
-                {"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "ser": current_ser or best_ser, "vocab": vocab.token2id},
-                output_dir / f"{model_type}_latest.pt",
-            )
-
-            if getattr(args, "save_snapshots", False) and should_eval_ser:
-                torch.save(
-                    {"model": model.state_dict(), "epoch": epoch, "val_loss": val_loss, "ser": current_ser, "vocab": vocab.token2id},
-                    snapshots_dir / f"{model_type}_epoch_{epoch:03d}.pt",
-                )
-
-            history.append({
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "token_acc": token_acc,
-                "ser": current_ser,
-                "sec": epoch_sec,
-            })
-
-            ser_str = f" | Val SER: {current_ser:.2f}%" if current_ser is not None else ""
-            print(
-                f"Epoch {epoch:02d}/{args.epochs:02d} | "
-                f"Train Loss: {train_loss:.4f} | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Token Acc: {token_acc:.2f}%"
-                f"{ser_str} | "
-                f"Time: {epoch_sec:.1f}s"
-            )
-
-    total_training_time = time.time() - start_time
-
-    # Final validation SER if not evaluated yet
-    if best_ser == float("inf"):
-        print(f"\nComputing Final Validation SER for {model_type}...")
-        best_ser = evaluate_ser(model, val_loader, vocab, max_length=args.max_gen_length, device=device)
-        print(f"Final Validation SER: {best_ser:.2f}%")
-    else:
-        print(f"\nBest Validation SER achieved during run: {best_ser:.2f}%")
-
-    # Evaluate on Test Set if provided (matching Zeus test evaluation)
-    test_ser = None
-    if test_dataset is not None and len(test_dataset) > 0:
-        print(f"\n=======================================================")
-        print(f" Running Test Set Evaluation for {model_type}...")
-        print(f"=======================================================")
-        best_ckpt = output_dir / f"{model_type}_best.pt"
-        if best_ckpt.exists():
-            print(f"Loading best weights for test evaluation from: {best_ckpt}")
-            ckpt_data = torch.load(best_ckpt, map_location=device)
-            model.load_state_dict(ckpt_data.get("model", ckpt_data))
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=args.num_workers,
+        # Periodic Symbol Error Rate (SER) evaluation matching Zeus
+        should_eval_ser = (
+            args.evaluation_each > 0
+            and epoch >= args.evaluation_from
+            and (epoch % args.evaluation_each == 0 or epoch == args.epochs)
         )
-        test_ser = evaluate_ser(model, test_loader, vocab, max_length=args.max_gen_length, device=device)
+        current_ser = evaluate_ser(model, val_loader, vocab, device) if should_eval_ser else None
+
+        record = {
+            "epoch": epoch,
+            "lr": lr,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "token_acc": token_acc,
+            "ser": current_ser,
+            "sec": time.time() - epoch_start,
+        }
+        history.append(record)
+        train_time = prior_train_time + time.time() - start_time
+
+        improved = record[select_by] is not None and (best is None or record[select_by] < best[select_by])
+        if improved:
+            best = {k: record[k] for k in ("epoch", "train_loss", "val_loss", "token_acc", "ser")}
+            save_checkpoint(best_path, model, optimizer, vocab, epoch, best, history, train_time)
+
+        save_checkpoint(latest_path, model, optimizer, vocab, epoch, best, history, train_time)
+
+        if args.save_snapshots and should_eval_ser:
+            save_checkpoint(
+                snapshots_dir / f"{model_type}_epoch_{epoch:03d}.pt",
+                model, optimizer, vocab, epoch, best, history, train_time,
+            )
+
+        ser_str = f" | Val SER: {current_ser:.2f}%" if current_ser is not None else ""
+        print(
+            f"Epoch {epoch:02d}/{args.epochs:02d} | "
+            f"LR: {lr:.2e} | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Val Loss: {val_loss:.4f} | "
+            f"Token Acc: {token_acc:.2f}%"
+            f"{ser_str} | "
+            f"Time: {record['sec']:.1f}s"
+            f"{' | * best' if improved else ''}"
+        )
+
+    total_training_time = prior_train_time + time.time() - start_time
+
+    # Report all validation and test metrics from one set of weights: the selected checkpoint
+    if args.eval_only:
+        print(f"\nEvaluating the loaded checkpoint (epoch {checkpoint.get('epoch')})...")
+        best = {"epoch": checkpoint.get("epoch"), "train_loss": None, "val_loss": None, "token_acc": None, "ser": None}
+    elif best is not None and best_path.is_file():
+        print(f"\nLoading the selected checkpoint (epoch {best['epoch']}, by {select_by}) from: {best_path}")
+        model.load_state_dict(load_checkpoint(best_path)["model"])
+    else:
+        print("\nNo checkpoint was selected during training; evaluating the final weights.")
+        last = history[-1] if history else {"epoch": start_epoch - 1, "train_loss": None}
+        best = {"epoch": last["epoch"], "train_loss": last["train_loss"], "val_loss": None, "token_acc": None, "ser": None}
+
+    if best["val_loss"] is None:
+        best["val_loss"], best["token_acc"] = evaluate_teacher_forced(model, val_loader, criterion, vocab, device)
+    if best["ser"] is None:
+        best["ser"] = evaluate_ser(model, val_loader, vocab, device)
+    print(
+        f"Selected checkpoint: epoch {best['epoch']} | Val Loss: {best['val_loss']:.4f} | "
+        f"Token Acc: {best['token_acc']:.2f}% | Val SER: {best['ser']:.2f}%"
+    )
+
+    # Evaluate on Test Set if provided (matching Zeus test evaluation), also per dataset
+    test_ser = None
+    test_ser_per_dataset: dict[str, float] = {}
+    if test_dataset is not None and len(test_dataset) > 0:
+        print("\n=======================================================")
+        print(f" Running Test Set Evaluation for {model_type}...")
+        print("=======================================================")
+        gold = test_dataset.gold_lmx()
+        preds = predict_lmx(model, make_loader(test_dataset, args, shuffle=False), vocab, device)
+        test_ser = symbol_error_rate(gold, preds)
         print(f"Final Test SER: {test_ser:.2f}%")
 
-    final_train_loss = history[-1]["train_loss"] if history else 0.0
-    final_token_acc = history[-1]["token_acc"] if history else 0.0
-    elapsed_epochs = max(1, len(history))
+        names = test_dataset.dataset_names()
+        if len(set(names)) > 1:
+            for name in dict.fromkeys(names):
+                idx = [i for i, n in enumerate(names) if n == name]
+                test_ser_per_dataset[name] = symbol_error_rate([gold[i] for i in idx], [preds[i] for i in idx])
+                print(f"  - {name}: {test_ser_per_dataset[name]:.2f}%")
 
+    epochs_trained = len(history)
     return {
-        "model": "Zeus Baseline (Run 1)" if model_type == "zeus" else "MuSViT + Zeus (Run 2)",
+        **RUN_INFO[model_type],
         "model_type": model_type,
-        "encoder": "CNN-BiLSTM" if model_type == "zeus" else "MuSViT + Adapter",
         "enc_params": enc_params,
         "dec_params": dec_params,
         "total_params": total_params,
-        "train_loss": round(final_train_loss, 4),
-        "val_loss": round(best_val_loss, 4),
-        "token_acc": round(final_token_acc, 2),
-        "ser": round(best_ser, 2),
+        "select_by": select_by,
+        "best_epoch": best["epoch"],
+        "train_loss": round(best["train_loss"], 4) if best["train_loss"] is not None else None,
+        "val_loss": round(best["val_loss"], 4),
+        "token_acc": round(best["token_acc"], 2),
+        "ser": round(best["ser"], 2),
         "test_ser": round(test_ser, 2) if test_ser is not None else None,
+        "test_ser_per_dataset": {k: round(v, 2) for k, v in test_ser_per_dataset.items()},
+        "epochs_trained": epochs_trained,
         "total_time_sec": round(total_training_time, 1),
-        "avg_epoch_sec": round(total_training_time / elapsed_epochs, 2),
+        "avg_epoch_sec": round(total_training_time / max(1, epochs_trained), 2),
         "history": history,
     }
 
@@ -393,58 +442,40 @@ def export_results_table(results: list[dict], output_dir: str | Path):
 
     # 1. Save individual JSON results
     for r in results:
-        m_type = r.get("model_type", "zeus" if "Zeus" in r.get("model", "") else "musvit")
-        json_path = out_dir / f"{m_type}_results.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            serializable = {k: v for k, v in r.items() if k != "history"}
-            json.dump(serializable, f, indent=2)
+        with open(out_dir / f"{r['model_type']}_results.json", "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in r.items() if k != "history"}, f, indent=2)
 
-    # 2. Check for previously saved counterpart run to merge
+    # 2. Merge with a previously saved counterpart run
     all_runs: dict[str, dict] = {}
-    for other_type in ["zeus", "musvit"]:
-        cand_json = out_dir / f"{other_type}_results.json"
+    for model_type in RUN_INFO:
+        cand_json = out_dir / f"{model_type}_results.json"
         if cand_json.exists():
             try:
                 with open(cand_json, "r", encoding="utf-8") as f:
-                    all_runs[other_type] = json.load(f)
-            except Exception:
-                pass
-
+                    all_runs[model_type] = json.load(f)
+            except json.JSONDecodeError as e:
+                print(f"Warning: skipping unreadable results file '{cand_json}': {e}")
     for r in results:
-        m_type = r.get("model_type", "zeus" if "Zeus" in r.get("model", "") else "musvit")
-        all_runs[m_type] = r
+        all_runs[r["model_type"]] = r
+    merged_results = [all_runs[t] for t in RUN_INFO if t in all_runs]
 
-    merged_results = list(all_runs.values())
-    merged_results.sort(
-        key=lambda x: 0 if "run 1" in str(x.get("model", "")).lower() or x.get("model_type") == "zeus" else 1
-    )
+    if len({json.dumps(r.get("datasets"), sort_keys=True) for r in merged_results}) > 1:
+        print("Warning: the merged runs use different dataset selections, so they are not directly comparable:")
+        for r in merged_results:
+            print(f"  - {r['model']}: {r.get('datasets')}")
+
+    def fmt_pct(value) -> str:
+        return f"{value:.2f}%" if value is not None else "N/A"
 
     has_any_test = any(r.get("test_ser") is not None for r in merged_results)
+    per_dataset_names = sorted({n for r in merged_results for n in (r.get("test_ser_per_dataset") or {})})
+
+    headers = ["Model Run", "Encoder", "Enc Params", "Dec Params", "Total Params", "Best Epoch",
+               "Val Loss", "Token Acc (%)", "Val SER (%)"]
     if has_any_test:
-        headers = [
-            "Model Run",
-            "Encoder",
-            "Enc Params",
-            "Dec Params",
-            "Total Params",
-            "Val Loss (best)",
-            "Token Acc (%)",
-            "Val SER (%)",
-            "Test SER (%)",
-            "Train Time (s)",
-        ]
-    else:
-        headers = [
-            "Model Run",
-            "Encoder",
-            "Enc Params",
-            "Dec Params",
-            "Total Params",
-            "Val Loss (best)",
-            "Token Acc (%)",
-            "SER (%)",
-            "Train Time (s)",
-        ]
+        headers.append("Test SER (%)")
+        headers.extend(f"Test SER {name} (%)" for name in per_dataset_names)
+    headers.append("Train Time (s)")
 
     rows = []
     for r in merged_results:
@@ -454,12 +485,14 @@ def export_results_table(results: list[dict], output_dir: str | Path):
             f"{r['enc_params']:,}",
             f"{r['dec_params']:,}",
             f"{r['total_params']:,}",
-            f"{r['val_loss']:.4f}",
-            f"{r['token_acc']:.2f}%",
-            f"{r['ser']:.2f}%",
+            str(r.get("best_epoch", "N/A")),
+            f"{r['val_loss']:.4f}" if r.get("val_loss") is not None else "N/A",
+            fmt_pct(r.get("token_acc")),
+            fmt_pct(r.get("ser")),
         ]
         if has_any_test:
-            row.append(f"{r['test_ser']:.2f}%" if r.get("test_ser") is not None else "N/A")
+            row.append(fmt_pct(r.get("test_ser")))
+            row.extend(fmt_pct((r.get("test_ser_per_dataset") or {}).get(name)) for name in per_dataset_names)
         row.append(f"{r['total_time_sec']:.1f}s")
         rows.append(row)
 
@@ -482,24 +515,27 @@ def export_results_table(results: list[dict], output_dir: str | Path):
         f.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
         for r in rows:
             f.write("| " + " | ".join(r) + " |\n")
-        f.write("\n### Key Takeaways:\n")
-        if len(merged_results) >= 2:
-            r1, r2 = merged_results[0], merged_results[1]
-            val_ser_diff = r1["ser"] - r2["ser"]
-            speed_ratio = r1["total_time_sec"] / max(1e-3, r2["total_time_sec"])
+        if "zeus" in all_runs and "musvit" in all_runs:
+            zeus_run, musvit_run = all_runs["zeus"], all_runs["musvit"]
+            f.write("\n### Key Takeaways:\n")
+            val_ser_diff = zeus_run["ser"] - musvit_run["ser"]
             if val_ser_diff > 0:
-                f.write(f"- **MuSViT + Zeus outperforms Zeus Baseline by {val_ser_diff:.2f}% lower Validation SER!**\n")
+                f.write(f"- **MuSViT + Zeus outperforms Zeus Baseline by {val_ser_diff:.2f} pp lower Validation SER!**\n")
             else:
-                f.write(f"- **Zeus Baseline had {-val_ser_diff:.2f}% lower Validation SER than MuSViT + Zeus.**\n")
+                f.write(f"- **Zeus Baseline had {-val_ser_diff:.2f} pp lower Validation SER than MuSViT + Zeus.**\n")
 
-            if r1.get("test_ser") is not None and r2.get("test_ser") is not None:
-                test_ser_diff = r1["test_ser"] - r2["test_ser"]
+            if zeus_run.get("test_ser") is not None and musvit_run.get("test_ser") is not None:
+                test_ser_diff = zeus_run["test_ser"] - musvit_run["test_ser"]
                 if test_ser_diff > 0:
-                    f.write(f"- **MuSViT + Zeus outperforms Zeus Baseline by {test_ser_diff:.2f}% lower Test SER!**\n")
+                    f.write(f"- **MuSViT + Zeus outperforms Zeus Baseline by {test_ser_diff:.2f} pp lower Test SER!**\n")
                 else:
-                    f.write(f"- **Zeus Baseline had {-test_ser_diff:.2f}% lower Test SER than MuSViT + Zeus.**\n")
+                    f.write(f"- **Zeus Baseline had {-test_ser_diff:.2f} pp lower Test SER than MuSViT + Zeus.**\n")
 
-            f.write(f"- Pre-extracted MuSViT training speed ratio: **{speed_ratio:.2f}x** relative to image CNN.\n")
+            speed_ratio = zeus_run["total_time_sec"] / max(1e-3, musvit_run["total_time_sec"])
+            f.write(
+                f"- Training time ratio Zeus / MuSViT: **{speed_ratio:.2f}x** "
+                f"(excluding MuSViT feature extraction).\n"
+            )
 
     # 3. Write CSV
     csv_path = out_dir / "results_table.csv"
@@ -508,27 +544,9 @@ def export_results_table(results: list[dict], output_dir: str | Path):
         writer.writerow(headers)
         writer.writerows(rows)
 
-    print(f"Results successfully saved:")
+    print("Results successfully saved:")
     print(f"  - Markdown: {md_path}")
     print(f"  - CSV:      {csv_path}")
-
-
-def resolve_split_paths(explicit_paths: list[str] | None, dataset_dir: str | Path | None, split: str) -> list[Path]:
-    """Resolves dataset pickle files from explicit arguments or dataset directory."""
-    if explicit_paths:
-        return [Path(p) for p in explicit_paths]
-    if dataset_dir:
-        base = Path(dataset_dir)
-        if base.is_dir():
-            aliases = ["dev", "val", "validation"] if split in ["dev", "val", "validation"] else [split]
-            found = []
-            for s in aliases:
-                found.extend(base.glob(f"samples.{s}.pickle"))
-                found.extend(base.glob(f"*/samples.{s}.pickle"))
-            found = sorted(list(set(found)))
-            if found:
-                return found
-    return []
 
 
 def main():
@@ -540,32 +558,30 @@ def main():
         choices=["zeus", "musvit", "compare"],
         help="Select 'zeus' (Run 1), 'musvit' (Run 2), or 'compare' (runs both consecutively).",
     )
-    # Zeus CLI compatibility flags
+    # Dataset selection: every split uses the datasets' own predefined splits
+    parser.add_argument("--dataset-dir", type=str, default="datasets", help="Directory containing the datasets as subfolders (default: datasets).")
     parser.add_argument(
-        "--train",
+        "--datasets",
         type=str,
-        nargs="*",
+        nargs="+",
         default=None,
-        help="Path(s) to training dataset pickle(s), e.g. datasets/omniomr/samples.train.pickle (matches Zeus --train).",
+        help="Datasets used for all splits unless overridden by --train/--dev/--test "
+             "(default: all datasets in --dataset-dir).",
     )
+    dataset_spec_help = (
+        "Dataset(s) whose predefined '{}' split to use: names of subfolders of --dataset-dir, "
+        "dataset folders, or .pickle files (default: --datasets)."
+    )
+    parser.add_argument("--train", type=str, nargs="+", default=None, help=dataset_spec_help.format("train"))
+    parser.add_argument("--dev", "--val", dest="dev", type=str, nargs="+", default=None, help=dataset_spec_help.format("dev"))
     parser.add_argument(
-        "--dev",
-        "--val",
-        dest="dev",
-        type=str,
-        nargs="*",
-        default=None,
-        help="Path(s) to validation dataset pickle(s), e.g. datasets/omniomr/samples.dev.pickle (matches Zeus --dev).",
+        "--test", type=str, nargs="*", default=None,
+        help=dataset_spec_help.format("test") + " Pass --test without values to skip testing.",
     )
-    parser.add_argument(
-        "--test",
-        type=str,
-        nargs="*",
-        default=None,
-        help="Path(s) to test dataset pickle(s), e.g. datasets/omniomr/samples.test.pickle (matches Zeus --test).",
-    )
-    parser.add_argument("--dataset-dir", type=str, default="datasets", help="Base directory containing Zeus datasets (default: datasets).")
     parser.add_argument("--feature-cache-dir", type=str, default="feature_cache", help="Directory of pre-extracted MuSViT features.")
+    parser.add_argument("--feature-stave-height", type=int, default=64, help="Stave height the MuSViT features were extracted with (extract_features.py --stave-height).")
+    parser.add_argument("--feature-layout", type=str, default="columns", choices=["columns", "raster"], help="Sequence made of the MuSViT patch grid: one timestep per patch column with its rows concatenated ('columns'), or the row-major patch sequence of the MuSViT documentation ('raster').")
+    parser.add_argument("--feature-precision", type=str, default="float16", choices=["float16", "float32"], help="Precision the MuSViT features were extracted with.")
     parser.add_argument("--output-dir", type=str, default="experiment_results", help="Directory to save logs, checkpoints and tables.")
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs (Zeus default: 400-500).")
     parser.add_argument("--batch-size", type=int, default=32, help="Training batch size (Zeus default: 32 or 64).")
@@ -575,65 +591,115 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Optimizer weight decay (used only if optimizer is adamw).")
     parser.add_argument("--dim", type=int, default=256, help="Model hidden / embedding dimension.")
     parser.add_argument("--timestep-width", type=int, default=16, help="Timestep width for Zeus encoder (default: 16 matching solo26).")
+    parser.add_argument("--image-height", type=int, default=96, help="Height stave images are scaled to for the Zeus encoder.")
+    parser.add_argument("--max-image-width", type=int, default=1536, help="Maximum width of stave images after scaling.")
     parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate (default: 0.2 matching solo26).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
     parser.add_argument("--evaluation-from", type=int, default=1, help="Start evaluation with this epoch onward (matches Zeus).")
-    parser.add_argument("--evaluation-each", "--eval-interval", dest="evaluation_each", type=int, default=10, help="Run validation evaluation every N epochs (matches Zeus).")
+    parser.add_argument("--evaluation-each", "--eval-interval", dest="evaluation_each", type=int, default=10, help="Run validation SER evaluation every N epochs (matches Zeus). The best checkpoint is selected by it; 0 selects by validation loss instead.")
     parser.add_argument("--resume", type=str, default=None, help="Resume training. Pass 'auto' or path to .pt checkpoint.")
     parser.add_argument("--save-snapshots", action="store_true", help="Save intermediate snapshot .pt checkpoints for evaluated epochs (matching Zeus).")
-    parser.add_argument("--eval-only", action="store_true", help="Skip training and only compute validation SER on loaded/existing checkpoint.")
-    parser.add_argument("--max-gen-length", type=int, default=300, help="Max length for autoregressive evaluation.")
+    parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate the best checkpoint (or the one given by --resume).")
+    parser.add_argument("--max-gen-length", type=int, default=None, help="Max length for autoregressive decoding (default: 1.2x the longest training sequence).")
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda' or 'cpu'). Auto-detected if not specified.")
 
     args = parser.parse_args()
-    set_seed(args.seed)
+    if args.model == "compare" and args.resume and args.resume.lower() != "auto":
+        parser.error("--resume with a checkpoint path needs a single --model; use --resume auto with --model compare.")
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Active Device: {device}")
 
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Resolve and load dataset pickles
-    train_pickles = resolve_split_paths(args.train, args.dataset_dir, "train")
-    dev_pickles = resolve_split_paths(args.dev, args.dataset_dir, "dev")
-    test_pickles = resolve_split_paths(args.test, args.dataset_dir, "test")
+    # 1. Select datasets for each split and load their predefined splits
+    default_datasets = args.datasets or discover_datasets(args.dataset_dir)
+    train_specs = args.train or default_datasets
+    dev_specs = args.dev or default_datasets
+    test_specs = args.test if args.test is not None else default_datasets
 
-    if not train_pickles:
+    if not train_specs:
         raise FileNotFoundError(
-            f"No training pickles found. Specify --train <path.pickle> or provide a --dataset-dir containing samples.train.pickle.\n"
+            f"No datasets selected and none found in '{args.dataset_dir}'.\n"
             f"To convert MusiCorpus datasets to Zeus pickles, run:\n"
-            f"  zeus musicorpus --input <mc_dataset> --output datasets/<name> --take-staves\n"
-            f"  zeus pickle datasets/<name>/samples.train.txt"
+            f"  python -m musvit_zeus_comparison.zeus musicorpus --input <mc_dataset> --output {args.dataset_dir}/<name> --take-staves\n"
+            f"  python -m musvit_zeus_comparison.zeus pickle {args.dataset_dir}/<name>/samples.*.txt"
         )
 
     print("Loading training datasets...")
-    train_samples = load_zeus_pickles(train_pickles)
+    train_samples = load_split(train_specs, args.dataset_dir, "train")
     print("Loading validation datasets...")
-    val_samples = load_zeus_pickles(dev_pickles) if dev_pickles else []
+    val_samples = load_split(dev_specs, args.dataset_dir, "dev")
     print("Loading test datasets...")
-    test_samples = load_zeus_pickles(test_pickles) if test_pickles else []
+    test_samples = load_split(test_specs, args.dataset_dir, "test") if test_specs else {}
 
-    # 2. Build shared vocabulary from training split (matching Zeus TokenMap)
-    vocab = TokenVocabulary.build_from_samples(train_samples)
-    vocab_path = Path(args.output_dir) / "vocab.json"
-    if args.resume and vocab_path.exists():
-        print(f"Loading existing vocabulary from {vocab_path} to preserve exact checkpoint token mapping...")
-        vocab = TokenVocabulary.load(vocab_path)
-    else:
-        vocab.save(vocab_path)
+    selection = {"train": list(train_samples), "dev": list(val_samples), "test": list(test_samples)}
+    for split, names in selection.items():
+        print(f"  {split}: {', '.join(names) or '-'}")
 
-    test_info = f" | {len(test_samples):,} Test" if test_samples else ""
-    print(f"Data Split: {len(train_samples):,} Train | {len(val_samples):,} Validation{test_info}")
-    print(f"Vocabulary: {len(vocab):,} unique LMX tokens.")
+    all_train = [s for samples in train_samples.values() for s in samples]
+    n_val = sum(map(len, val_samples.values()))
+    n_test = sum(map(len, test_samples.values()))
+    if n_val == 0:
+        raise ValueError("The validation split is empty; it is needed for checkpoint selection.")
+    print(f"Data Split: {len(all_train):,} Train | {n_val:,} Validation | {n_test:,} Test")
+
+    # Decoding must be able to produce the longest transcriptions, or SER is inflated by truncation
+    max_train_len = max(len(s.lmx.split()) for s in all_train)
+    if args.max_gen_length is None:
+        args.max_gen_length = int(1.2 * max_train_len) + 1
+    print(f"Max generation length: {args.max_gen_length} (longest training sequence: {max_train_len} tokens)")
+    for split, samples in (("dev", val_samples), ("test", test_samples)):
+        too_long = sum(len(s.lmx.split()) > args.max_gen_length for ss in samples.values() for s in ss)
+        if too_long:
+            print(f"Warning: {too_long:,} {split} sample(s) are longer than the max generation length and will be truncated.")
 
     models_to_run = ["zeus", "musvit"] if args.model == "compare" else [args.model]
     results = []
 
     for m in models_to_run:
-        train_ds = StaveOMRDataset(train_samples, vocab=vocab, mode=m, feature_cache_dir=args.feature_cache_dir)
-        val_ds = StaveOMRDataset(val_samples, vocab=vocab, mode=m, feature_cache_dir=args.feature_cache_dir)
-        test_ds = StaveOMRDataset(test_samples, vocab=vocab, mode=m, feature_cache_dir=args.feature_cache_dir) if test_samples else None
+        checkpoint_path = resolve_checkpoint(args, m)
+        checkpoint = None
+        if checkpoint_path is not None:
+            print(f"Loading checkpoint from: {checkpoint_path}")
+            checkpoint = load_checkpoint(checkpoint_path)
+
+        # 2. Vocabulary from the training split (matching Zeus TokenMap), or the checkpoint's exact mapping
+        if checkpoint is not None:
+            vocab = TokenVocabulary.from_dict(checkpoint["vocab"])
+            unknown = {t for s in all_train for t in s.lmx.split()} - vocab.token2id.keys()
+            if unknown:
+                print(f"Warning: {len(unknown):,} training token type(s) are not in the checkpoint's vocabulary and map to <unk>.")
+        else:
+            vocab = TokenVocabulary.build_from_samples(all_train)
+        vocab.save(output_dir / f"{m}_vocab.json")
+        print(f"Vocabulary: {len(vocab):,} unique LMX tokens.")
+
+        dataset_kwargs = dict(
+            vocab=vocab,
+            mode=m,
+            feature_cache_dir=args.feature_cache_dir,
+            feature_variant=feature_variant(args.feature_stave_height, args.feature_precision),
+            feature_layout=args.feature_layout,
+            image_height=args.image_height,
+            max_image_width=args.max_image_width,
+        )
+        train_ds = StaveOMRDataset(train_samples, **dataset_kwargs)
+        val_ds = StaveOMRDataset(val_samples, **dataset_kwargs)
+        test_ds = StaveOMRDataset(test_samples, **dataset_kwargs) if test_samples else None
+
+        musvit_dim = 768
+        if m == "musvit":
+            # Fail now rather than hours into training
+            missing = [p for ds in (train_ds, val_ds, test_ds) if ds is not None for p in ds.missing_features()]
+            if missing:
+                raise FileNotFoundError(
+                    f"{len(missing):,} MuSViT feature file(s) are missing, e.g. '{missing[0]}'. Run extract_features.py "
+                    f"with --stave-height {args.feature_stave_height} --precision {args.feature_precision} first."
+                )
+            musvit_dim = train_ds[0][0].shape[-1]
 
         res = train_single_model(
             model_type=m,
@@ -643,7 +709,10 @@ def main():
             args=args,
             device=device,
             test_dataset=test_ds,
+            checkpoint=checkpoint,
+            musvit_dim=musvit_dim,
         )
+        res["datasets"] = selection
         results.append(res)
 
     # 3. Export findings into table

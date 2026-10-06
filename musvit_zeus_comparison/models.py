@@ -10,6 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def lengths_to_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    """(B,) lengths -> (B, max_len) bool mask, True at valid timesteps."""
+    return torch.arange(max_len, device=lengths.device)[None, :] < lengths[:, None]
+
+
 # ==============================================================================
 # Shared Bahdanau Attention & LSTM Decoder
 # ==============================================================================
@@ -24,32 +29,27 @@ class BahdanauAttention(nn.Module):
         self.encoder_proj = nn.Linear(encoder_dim, attention_dim, bias=True)
         self.decoder_proj = nn.Linear(decoder_dim * 2, attention_dim, bias=True)  # concatenated (h, c)
         self.score_proj = nn.Linear(attention_dim, 1, bias=True)
-        self._cached_encoder_proj: torch.Tensor | None = None
 
-    def precompute(self, encoder_outputs: torch.Tensor):
-        """Precomputes projected encoder representations to avoid recomputation at every token step."""
-        self._cached_encoder_proj = self.encoder_proj(encoder_outputs)
-
-    def clear_cache(self):
-        self._cached_encoder_proj = None
+    def project_encoder(self, encoder_outputs: torch.Tensor) -> torch.Tensor:
+        """Projects encoder outputs once per sequence, instead of at every decoding step."""
+        return self.encoder_proj(encoder_outputs)
 
     def forward(
         self,
         encoder_outputs: torch.Tensor,
+        encoder_proj: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor],
         mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # state: (h, c) each of shape (B, decoder_dim)
         prev_state = torch.cat(state, dim=-1)  # (B, 2 * decoder_dim)
-
-        enc_proj = self._cached_encoder_proj if self._cached_encoder_proj is not None else self.encoder_proj(encoder_outputs)
         dec_proj = self.decoder_proj(prev_state).unsqueeze(1)  # (B, 1, attention_dim)
 
         # Energy scores: (B, T, 1) -> (B, T)
-        scores = self.score_proj(torch.tanh(enc_proj + dec_proj)).squeeze(-1)
+        scores = self.score_proj(torch.tanh(encoder_proj + dec_proj)).squeeze(-1)
 
         if mask is not None:
-            scores = scores.masked_fill(~mask, float("-1e9"))
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
 
         attn_weights = F.softmax(scores, dim=-1)  # (B, T)
         context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs).squeeze(1)  # (B, enc_dim)
@@ -97,28 +97,25 @@ class ZeusDecoder(nn.Module):
         Args:
             context: (B, T, dim) encoder output sequence
             target_seq: (B, L) input token IDs (starting with BOS)
-            context_mask: optional (B, T) mask
+            context_mask: optional (B, T) mask, True at valid timesteps
         Returns:
             logits: (B, L, vocab_size)
         """
         batch_size, seq_len = target_seq.shape
         embedded = self.dropout(self.embedding(target_seq))  # (B, L, dim)
+        encoder_proj = self.attention.project_encoder(context)
 
         # Initialize hidden and cell states with zeros
         h = torch.zeros(batch_size, self.dim, device=context.device, dtype=context.dtype)
         c = torch.zeros(batch_size, self.dim, device=context.device, dtype=context.dtype)
 
         outputs = []
-        self.attention.precompute(context)
-        try:
-            for t in range(seq_len):
-                x_t = embedded[:, t, :]  # (B, dim)
-                ctx_t, _ = self.attention(context, (h, c), mask=context_mask)  # (B, dim)
-                lstm_input = torch.cat([x_t, ctx_t], dim=-1)  # (B, 2*dim)
-                h, c = self.lstm_cell(lstm_input, (h, c))
-                outputs.append(h)
-        finally:
-            self.attention.clear_cache()
+        for t in range(seq_len):
+            x_t = embedded[:, t, :]  # (B, dim)
+            ctx_t, _ = self.attention(context, encoder_proj, (h, c), mask=context_mask)  # (B, dim)
+            lstm_input = torch.cat([x_t, ctx_t], dim=-1)  # (B, 2*dim)
+            h, c = self.lstm_cell(lstm_input, (h, c))
+            outputs.append(h)
 
         stacked_h = torch.stack(outputs, dim=1)  # (B, L, dim)
         logits = self.fc_out(self.dropout(stacked_h))  # (B, L, vocab_size)
@@ -138,6 +135,7 @@ class ZeusDecoder(nn.Module):
         """
         max_len = max_length or self.max_length
         batch_size = context.shape[0]
+        encoder_proj = self.attention.project_encoder(context)
 
         curr_token = torch.full((batch_size,), self.bos_idx, dtype=torch.long, device=context.device)
         h = torch.zeros(batch_size, self.dim, device=context.device, dtype=context.dtype)
@@ -146,26 +144,22 @@ class ZeusDecoder(nn.Module):
         preds = []
         is_finished = torch.zeros(batch_size, dtype=torch.bool, device=context.device)
 
-        self.attention.precompute(context)
-        try:
-            for _ in range(max_len):
-                x_t = self.embedding(curr_token)  # (B, dim)
-                ctx_t, _ = self.attention(context, (h, c), mask=context_mask)
-                lstm_input = torch.cat([x_t, ctx_t], dim=-1)
-                h, c = self.lstm_cell(lstm_input, (h, c))
-                logits = self.fc_out(h)  # (B, vocab_size)
-                next_token = torch.argmax(logits, dim=-1)  # (B,)
+        for _ in range(max_len):
+            x_t = self.embedding(curr_token)  # (B, dim)
+            ctx_t, _ = self.attention(context, encoder_proj, (h, c), mask=context_mask)
+            lstm_input = torch.cat([x_t, ctx_t], dim=-1)
+            h, c = self.lstm_cell(lstm_input, (h, c))
+            logits = self.fc_out(h)  # (B, vocab_size)
+            next_token = torch.argmax(logits, dim=-1)  # (B,)
 
-                # If sequence was already finished, record pad_idx
-                token_to_record = torch.where(is_finished, torch.full_like(next_token, self.pad_idx), next_token)
-                preds.append(token_to_record)
+            # If sequence was already finished, record pad_idx
+            token_to_record = torch.where(is_finished, torch.full_like(next_token, self.pad_idx), next_token)
+            preds.append(token_to_record)
 
-                is_finished = is_finished | (next_token == self.eos_idx)
-                if is_finished.all():
-                    break
-                curr_token = torch.where(is_finished, torch.full_like(next_token, self.pad_idx), next_token)
-        finally:
-            self.attention.clear_cache()
+            is_finished = is_finished | (next_token == self.eos_idx)
+            if is_finished.all():
+                break
+            curr_token = torch.where(is_finished, torch.full_like(next_token, self.pad_idx), next_token)
 
         if not preds:
             return torch.empty((batch_size, 0), dtype=torch.long, device=context.device)
@@ -215,8 +209,14 @@ class BiLSTMSumBlock(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.residual = residual
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)  # (B, T, 2 * out_dim)
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        if lengths is None:
+            out, _ = self.lstm(x)  # (B, T, 2 * out_dim)
+        else:
+            # Packing keeps the backward direction from reading the batch padding first
+            packed = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            out, _ = self.lstm(packed)
+            out, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True, total_length=x.shape[1])
         fwd, bwd = out.chunk(2, dim=-1)
         summed = self.dropout(fwd + bwd)  # (B, T, out_dim)
         if self.residual:
@@ -273,21 +273,30 @@ class ZeusEncoder(nn.Module):
         self.rnn_input_size = curr_ch * reduced_h * self.remaining
 
         # Bidirectional LSTM layers with merge_mode='sum' and residual connection on layer 1+
-        rnn_layers = []
-        for layer_idx in range(num_lstm_layers):
-            in_d = self.rnn_input_size if layer_idx == 0 else dim
-            rnn_layers.append(
-                BiLSTMSumBlock(in_dim=in_d, out_dim=dim, dropout=dropout, residual=(layer_idx > 0))
+        self.rnn = nn.ModuleList(
+            BiLSTMSumBlock(
+                in_dim=self.rnn_input_size if layer_idx == 0 else dim,
+                out_dim=dim,
+                dropout=dropout,
+                residual=(layer_idx > 0),
             )
-        self.rnn = nn.Sequential(*rnn_layers)
+            for layer_idx in range(num_lstm_layers)
+        )
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # x: (B, 1, H, W)
+    def output_lengths(self, widths: torch.Tensor) -> torch.Tensor:
+        """Number of encoder timesteps produced from images of the given unpadded widths."""
+        lengths = widths
+        for _ in range(self.cnn_stages):
+            lengths = (lengths - 1) // 2 + 1  # 3x3 conv, stride 2, padding 1
+        return (lengths + self.remaining - 1) // self.remaining
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # x: (B, 1, H, W), lengths: optional (B,) unpadded image widths
         feat = self.conv(x)  # (B, C, H', W')
         B, C, H, W = feat.shape
 
         # Permute to (B, W', H'*C)
-        feat = feat.permute(0, 3, 2, 1).contiguous().view(B, W, H * C)
+        feat = feat.permute(0, 3, 2, 1).reshape(B, W, H * C)
 
         # Pad horizontal steps if not divisible by remaining
         if self.remaining > 1:
@@ -297,20 +306,24 @@ class ZeusEncoder(nn.Module):
                 W = feat.shape[1]
             feat = feat.reshape(B, W // self.remaining, H * C * self.remaining)
 
-        feat = self.pre_rnn_dropout(feat)
-        out = self.rnn(feat)  # (B, W // remaining, dim)
-        return out, None
+        out = self.pre_rnn_dropout(feat)
+        steps = self.output_lengths(lengths) if lengths is not None else None
+        for layer in self.rnn:
+            out = layer(out, steps)  # (B, W // remaining, dim)
+
+        mask = lengths_to_mask(steps, out.shape[1]) if steps is not None else None
+        return out, mask
 
 
 # ==============================================================================
-# Run 2: Minimal MuSViT Encoder (Pre-extracted Features or Live Backbone)
+# Run 2: Minimal MuSViT Encoder (Pre-extracted Features)
 # ==============================================================================
 
 class MusvitEncoder(nn.Module):
     """
     Minimal MuSViT Encoder (Run 2).
-    Adapts pre-extracted MuSViT representations (or on-the-fly ViT features)
-    to match the exact dimensional and sequential expectations of ZeusDecoder.
+    Adapts pre-extracted MuSViT representations to match
+    the exact dimensional and sequential expectations of ZeusDecoder.
     """
     def __init__(
         self,
@@ -334,21 +347,23 @@ class MusvitEncoder(nn.Module):
         self.lstm = BiLSTMSumBlock(in_dim=dim, out_dim=dim, dropout=dropout, residual=False)
         self.layer_norm = nn.LayerNorm(dim)
 
-    def forward(self, features: torch.Tensor, mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(self, features: torch.Tensor, lengths: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
-            features: (B, T, 768) pre-extracted MuSViT features (e.g. T=64 after vertical pooling)
-            mask: optional attention mask
+            features: (B, T, musvit_dim) pre-extracted MuSViT features
+                (e.g. T=64 patch columns with 4 rows of 768 concatenated, musvit_dim=3072)
+            lengths: optional (B,) unpadded sequence lengths
         Returns:
-            context: (B, T, dim) ready for ZeusDecoder
+            context: (B, T, dim) ready for ZeusDecoder, and the (B, T) mask of valid timesteps
         """
-        # Linear projection: (B, T, 768) -> (B, T, dim)
+        # Linear projection: (B, T, musvit_dim) -> (B, T, dim)
         projected = self.proj(features)
 
         # Sequential contextualization: (B, T, dim) -> (B, T, dim)
-        context = self.lstm(projected)
+        context = self.lstm(projected, lengths)
         context = self.layer_norm(context + projected)  # Residual connection
 
+        mask = lengths_to_mask(lengths, context.shape[1]) if lengths is not None else None
         return context, mask
 
 
@@ -368,6 +383,8 @@ class CombinedOMRModel(nn.Module):
         vocab_size: int,
         dim: int = 256,
         timestep_width: int = 16,
+        input_height: int = 96,
+        musvit_dim: int = 768,
         bos_idx: int = 0,
         eos_idx: int = 1,
         pad_idx: int = 2,
@@ -378,9 +395,9 @@ class CombinedOMRModel(nn.Module):
         self.encoder_type = encoder_type.lower()
 
         if self.encoder_type == "zeus":
-            self.encoder = ZeusEncoder(dim=dim, timestep_width=timestep_width, dropout=dropout)
+            self.encoder = ZeusEncoder(dim=dim, input_height=input_height, timestep_width=timestep_width, dropout=dropout)
         elif self.encoder_type == "musvit":
-            self.encoder = MusvitEncoder(dim=dim, dropout=dropout)
+            self.encoder = MusvitEncoder(dim=dim, musvit_dim=musvit_dim, dropout=dropout)
         else:
             raise ValueError(f"Unknown encoder_type: '{encoder_type}'. Must be 'zeus' or 'musvit'.")
 
@@ -395,14 +412,14 @@ class CombinedOMRModel(nn.Module):
             dropout=0.0,
         )
 
-    def forward(self, x: torch.Tensor, target_seq: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        context, ctx_mask = self.encoder(x, mask)
+    def forward(self, x: torch.Tensor, target_seq: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        context, ctx_mask = self.encoder(x, lengths)
         logits = self.decoder(context, target_seq, context_mask=ctx_mask)
         return logits
 
     @torch.inference_mode()
-    def generate(self, x: torch.Tensor, max_length: int | None = None) -> torch.Tensor:
-        context, ctx_mask = self.encoder(x)
+    def generate(self, x: torch.Tensor, lengths: torch.Tensor | None = None, max_length: int | None = None) -> torch.Tensor:
+        context, ctx_mask = self.encoder(x, lengths)
         preds = self.decoder.generate(context, max_length=max_length, context_mask=ctx_mask)
         return preds
 

@@ -2,7 +2,8 @@
 Unified Dataset Loader for single-staff OMR.
 
 Follows the Zeus repository workflow:
-- Ingests datasets from Zeus pickled slices (ZeusDatasetSample).
+- Datasets are subfolders of a common directory (e.g. datasets/omniomr, datasets/dolores),
+  each with its own predefined splits pickled by Zeus (samples.{train,dev,test}.pickle).
 - Run 1 (Zeus Baseline): decodes raw image bytes in-memory with aspect-ratio preserving scaling.
 - Run 2 (MuSViT + Zeus): loads pre-extracted feature embeddings from feature_cache.
 - Ground truth: tokenized directly from sample.lmx strings.
@@ -11,9 +12,6 @@ Follows the Zeus repository workflow:
 from __future__ import annotations
 
 import json
-import pickle
-import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -25,36 +23,6 @@ try:
     from musvit_zeus_comparison.zeus.data.zeus_dataset import ZeusDataset, ZeusDatasetSample
 except ImportError:
     from zeus.data.zeus_dataset import ZeusDataset, ZeusDatasetSample
-except ImportError:
-    # Standalone dataclass fallback if zeus package is accessed without editable install
-    @dataclass
-    class ZeusDatasetSample:  # type: ignore
-        sample_name: str
-        image: bytes
-        lmx: str
-
-    class _Unpickler(pickle.Unpickler):
-        def find_class(self, module: str, name: str):
-            if name == "ZeusDatasetSample":
-                return ZeusDatasetSample
-            return super().find_class(module, name)
-
-    class ZeusDataset:  # type: ignore
-        def __init__(self, name: str, samples: list[ZeusDatasetSample]):
-            self.name = name
-            self.samples = samples
-
-        @staticmethod
-        def load_from_pickle_file(pickle_path: Path) -> ZeusDataset:
-            with open(str(pickle_path), "rb") as f:
-                samples = _Unpickler(f).load()
-            return ZeusDataset(name=pickle_path.as_posix(), samples=samples)
-
-        @staticmethod
-        def combine_multiple(datasets: list[ZeusDataset]) -> ZeusDataset:
-            combined = [s for d in datasets for s in d.samples]
-            name = "+".join(d.name for d in datasets)
-            return ZeusDataset(name=name, samples=combined)
 
 
 # ==============================================================================
@@ -109,21 +77,27 @@ class TokenVocabulary:
     def __len__(self) -> int:
         return len(self.token2id)
 
+    def to_dict(self) -> dict:
+        return {"token2id": self.token2id, "special_tokens": self.special_tokens}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TokenVocabulary:
+        # Older checkpoints stored the bare token2id mapping
+        if "token2id" not in data:
+            data = {"token2id": data}
+        vocab = cls(special_tokens=data.get("special_tokens"))
+        vocab.token2id = dict(data["token2id"])
+        vocab.id2token = {int(v): k for k, v in vocab.token2id.items()}
+        return vocab
+
     def save(self, filepath: str | Path):
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump({
-                "token2id": self.token2id,
-                "special_tokens": self.special_tokens
-            }, f, indent=2)
+            json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
     def load(cls, filepath: str | Path) -> TokenVocabulary:
         with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        vocab = cls(special_tokens=data.get("special_tokens"))
-        vocab.token2id = data["token2id"]
-        vocab.id2token = {int(v): k for k, v in vocab.token2id.items()}
-        return vocab
+            return cls.from_dict(json.load(f))
 
     @classmethod
     def build_from_samples(cls, samples: list[ZeusDatasetSample]) -> TokenVocabulary:
@@ -136,25 +110,90 @@ class TokenVocabulary:
 
 
 # ==============================================================================
-# Helper to Load and Combine Pickled Slices
+# Dataset Selection and Loading of Pickled Splits
 # ==============================================================================
 
-def load_zeus_pickles(pickle_paths: list[str | Path]) -> list[ZeusDatasetSample]:
-    """Loads one or multiple Zeus dataset pickle slices and returns combined samples."""
-    datasets = []
-    for p in pickle_paths:
-        path = Path(p)
-        if not path.is_file():
-            raise FileNotFoundError(f"Zeus dataset pickle not found at: '{path}'")
-        ds = ZeusDataset.load_from_pickle_file(path)
-        print(f"Loaded {len(ds.samples):,} samples from '{path}'")
-        datasets.append(ds)
+SPLIT_ALIASES: dict[str, tuple[str, ...]] = {
+    "train": ("train",),
+    "dev": ("dev", "val", "validation"),
+    "test": ("test",),
+}
 
-    if not datasets:
+SplitSamples = dict[str, list[ZeusDatasetSample]]
+"""Samples of one split, keyed by the name of the dataset they come from."""
+
+
+def discover_datasets(dataset_dir: str | Path) -> list[str]:
+    """Names of all subfolders of `dataset_dir` that contain a pickled Zeus split."""
+    base = Path(dataset_dir)
+    if not base.is_dir():
         return []
+    return sorted(p.name for p in base.iterdir() if p.is_dir() and any(p.glob("samples.*.pickle")))
 
-    combined = ZeusDataset.combine_multiple(datasets)
-    return combined.samples
+
+def dataset_name(pickle_path: Path) -> str:
+    """A dataset is named after the folder holding its pickles, e.g. 'omniomr'."""
+    return pickle_path.parent.name
+
+
+def resolve_dataset_folder(spec: str | Path, dataset_dir: str | Path) -> Path:
+    """Resolves a dataset name (subfolder of `dataset_dir`) or a path to a dataset folder."""
+    folder = Path(dataset_dir) / spec
+    if folder.is_dir():
+        return folder
+    if Path(spec).is_dir():
+        return Path(spec)
+    available = ", ".join(discover_datasets(dataset_dir)) or "none"
+    raise FileNotFoundError(
+        f"Dataset '{spec}' not found. Datasets available in '{dataset_dir}': {available}"
+    )
+
+
+def resolve_split_pickle(spec: str | Path, dataset_dir: str | Path, split: str) -> Path:
+    """
+    Resolves a dataset specification to the pickle of its predefined `split`.
+    `spec` is a dataset name, a path to a dataset folder, or a path to a .pickle file (used as-is).
+    """
+    if Path(spec).suffix == ".pickle":
+        if not Path(spec).is_file():
+            raise FileNotFoundError(f"Zeus dataset pickle not found at: '{spec}'")
+        return Path(spec)
+
+    folder = resolve_dataset_folder(spec, dataset_dir)
+    for alias in SPLIT_ALIASES[split]:
+        candidate = folder / f"samples.{alias}.pickle"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Dataset '{spec}' has no pickled '{split}' split in '{folder}'. "
+        f"Run: python -m musvit_zeus_comparison.zeus pickle {folder}/samples.{split}.txt"
+    )
+
+
+def load_split(specs: list[str], dataset_dir: str | Path, split: str) -> SplitSamples:
+    """Loads the predefined `split` of each selected dataset."""
+    loaded: SplitSamples = {}
+    for spec in specs:
+        pickle_path = resolve_split_pickle(spec, dataset_dir, split)
+        name = dataset_name(pickle_path)
+        if name in loaded:
+            raise ValueError(f"Dataset '{name}' is selected more than once for the '{split}' split.")
+        loaded[name] = ZeusDataset.load_from_pickle_file(pickle_path).samples
+        print(f"Loaded {len(loaded[name]):,} {split} samples of '{name}' from '{pickle_path}'")
+    return loaded
+
+
+def feature_variant(stave_height: int, precision: str) -> str:
+    """Names a feature extraction setting, so that differently extracted features never mix."""
+    return f"stave{stave_height}_{precision}"
+
+
+def feature_cache_path(cache_dir: str | Path, dataset: str, sample_name: str, variant: str) -> Path:
+    """
+    Location of one sample's pre-extracted MuSViT features, shared by extraction and training.
+    Namespaced by dataset, since sample names are only unique within a dataset.
+    """
+    return Path(cache_dir) / dataset / variant / f"{sample_name}.pt"
 
 
 # ==============================================================================
@@ -165,33 +204,61 @@ class StaveOMRDataset(Dataset):
     """
     Dataset backed directly by in-memory ZeusDatasetSample objects.
     - Run 1 ('zeus'): decodes sample.image bytes into normalized grayscale tensor (1, H, W).
-    - Run 2 ('musvit'): loads pre-extracted feature embedding from feature_cache_dir.
+    - Run 2 ('musvit'): loads the pre-extracted (rows, columns, dim) MuSViT patch grid from feature_cache_dir
+      and arranges it as a sequence:
+        - 'columns': one timestep per patch column, its rows concatenated -> (columns, rows * dim)
+        - 'raster': row-major patch sequence, as in the MuSViT documentation -> (rows * columns, dim)
     - Targets: tokenized from sample.lmx string.
     """
     def __init__(
         self,
-        samples: list[ZeusDatasetSample],
+        samples: SplitSamples,
         vocab: TokenVocabulary,
         mode: str = "zeus",  # 'zeus' or 'musvit'
         feature_cache_dir: str | Path | None = None,
+        feature_variant: str = "stave64_float16",
+        feature_layout: str = "columns",  # 'columns' or 'raster'
         image_height: int = 96,  # Zeus single-staff standard height
         max_image_width: int = 1536,
     ):
-        self.samples = samples
+        self.items = [(name, sample) for name, dataset_samples in samples.items() for sample in dataset_samples]
         self.vocab = vocab
         self.mode = mode.lower()
-        self.feature_cache_dir = Path(feature_cache_dir) if feature_cache_dir else None
+        self.feature_cache_dir = feature_cache_dir
+        self.feature_variant = feature_variant
+        self.feature_layout = feature_layout
         self.image_height = image_height
         self.max_image_width = max_image_width
 
-    def __len__(self) -> int:
-        return len(self.samples)
+        if self.mode == "musvit" and feature_cache_dir is None:
+            raise ValueError("feature_cache_dir must be specified for mode='musvit'.")
+        if feature_layout not in ("columns", "raster"):
+            raise ValueError(f"Unknown feature_layout '{feature_layout}'. Must be 'columns' or 'raster'.")
 
-    def _load_image(self, image_bytes: bytes) -> torch.Tensor:
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def gold_lmx(self) -> list[str]:
+        """Gold LMX strings in dataset order."""
+        return [sample.lmx for _, sample in self.items]
+
+    def dataset_names(self) -> list[str]:
+        """Name of the source dataset of each sample, in dataset order."""
+        return [name for name, _ in self.items]
+
+    def feature_path(self, idx: int) -> Path:
+        name, sample = self.items[idx]
+        return feature_cache_path(self.feature_cache_dir, name, sample.sample_name, self.feature_variant)
+
+    def missing_features(self) -> list[Path]:
+        """Feature files that have not been extracted yet (mode 'musvit' only)."""
+        return [path for path in map(self.feature_path, range(len(self))) if not path.is_file()]
+
+    def _load_image(self, image_bytes: bytes, sample_name: str) -> torch.Tensor:
         """Loads and normalizes image for Zeus (Run 1). Height is fixed, width preserves aspect ratio."""
         img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
         if img is None:
-            img = np.ones((self.image_height, 256), dtype=np.uint8) * 255
+            raise ValueError(f"Could not decode the image of sample '{sample_name}'.")
 
         h, w = img.shape
         new_w = max(1, int(round(w * self.image_height / h)))
@@ -203,36 +270,28 @@ class StaveOMRDataset(Dataset):
         return tensor
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        sample = self.samples[idx]
-        tokens = sample.lmx.split()
-        token_tensor = torch.tensor(self.vocab.encode(tokens), dtype=torch.long)
+        _, sample = self.items[idx]
+        token_tensor = torch.tensor(self.vocab.encode(sample.lmx.split()), dtype=torch.long)
 
         if self.mode == "musvit":
-            if self.feature_cache_dir is None:
-                raise ValueError("feature_cache_dir must be specified for mode='musvit'.")
-
-            # Canonical slug: e.g. 'samples_chopin_op17_Staves_0'
-            sample_slug = sample.sample_name.replace("/", "_").replace("\\", "_")
-            feat_path = self.feature_cache_dir / f"{sample_slug}_vertical_mean_float16.pt"
-            if not feat_path.is_file() and sample_slug.startswith("samples_"):
-                # Fallback without 'samples_' prefix
-                alt_path = self.feature_cache_dir / f"{sample_slug[8:]}_vertical_mean_float16.pt"
-                if alt_path.is_file():
-                    feat_path = alt_path
-
-            if feat_path.is_file():
-                feat = torch.load(feat_path, map_location="cpu", weights_only=True)
-                return feat.float(), token_tensor
-            else:
+            feat_path = self.feature_path(idx)
+            if not feat_path.is_file():
                 raise FileNotFoundError(
                     f"Pre-extracted MuSViT feature file not found for sample '{sample.sample_name}'. "
                     f"Looked at: '{feat_path}'. Please run extract_features.py before training MuSViT."
                 )
+            grid = torch.load(feat_path, map_location="cpu", weights_only=True).float()
+            if grid.dim() != 3:
+                raise ValueError(f"Expected a (rows, columns, dim) patch grid in '{feat_path}', got shape {tuple(grid.shape)}.")
+            rows, columns, dim = grid.shape
+            if self.feature_layout == "columns":
+                # Like the Zeus encoder flattening H x C per column, keeps the vertical (pitch) position
+                feat = grid.permute(1, 0, 2).reshape(columns, rows * dim)
+            else:
+                feat = grid.reshape(rows * columns, dim)
+            return feat, token_tensor
 
-        else:
-            # Mode 'zeus': decode image bytes
-            img_tensor = self._load_image(sample.image)
-            return img_tensor, token_tensor
+        return self._load_image(sample.image, sample.sample_name), token_tensor
 
 
 # ==============================================================================
@@ -246,36 +305,35 @@ class StaveCollate:
         self.bos_idx = bos_idx
         self.eos_idx = eos_idx
 
-    def __call__(self, batch: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        inputs, targets = zip(*batch)
+    def __call__(
+        self, batch: list[tuple[torch.Tensor, torch.Tensor]]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            inputs: (B, 1, H, W_max) images padded with white, or (B, T_max, D) features padded with zeros
+            input_lengths: (B,) unpadded widths (images) or sequence lengths (features)
+            input_seqs: (B, L+1) teacher forcing inputs [BOS, t_1, ..., t_L]
+            target_labels: (B, L+1) labels for loss [t_1, ..., t_L, EOS]
+        """
+        inputs, targets = zip(*batch, strict=True)
 
-        # Pad inputs (either 3D images [1, H, W] or 2D feature sequences [T, D])
+        # Images are (1, H, W) and padded along W; feature sequences are (T, D) and padded along T
         is_image = (inputs[0].dim() == 3)
+        length_dim = 2 if is_image else 0
+        pad_value = 1.0 if is_image else 0.0
 
-        if is_image:
-            max_w = max(x.shape[2] for x in inputs)
-            padded_inputs = []
-            for x in inputs:
-                pad_w = max_w - x.shape[2]
-                if pad_w > 0:
-                    x = torch.nn.functional.pad(x, (0, pad_w, 0, 0), value=1.0)
-                padded_inputs.append(x)
-            batch_inputs = torch.stack(padded_inputs, dim=0)
-
-        else:
-            # Feature sequences: (T, 768)
-            max_t = max(x.shape[0] for x in inputs)
-            padded_inputs = []
-            for x in inputs:
-                pad_t = max_t - x.shape[0]
-                if pad_t > 0:
-                    x = torch.nn.functional.pad(x, (0, 0, 0, pad_t), value=0.0)
-                padded_inputs.append(x)
-            batch_inputs = torch.stack(padded_inputs, dim=0)
+        input_lengths = torch.tensor([x.shape[length_dim] for x in inputs], dtype=torch.long)
+        max_len_in = int(input_lengths.max())
+        padded_inputs = []
+        for x in inputs:
+            pad = max_len_in - x.shape[length_dim]
+            if pad > 0:
+                padding = (0, pad, 0, 0) if is_image else (0, 0, 0, pad)
+                x = torch.nn.functional.pad(x, padding, value=pad_value)
+            padded_inputs.append(x)
+        batch_inputs = torch.stack(padded_inputs, dim=0)
 
         # Pad target sequences
-        # Teacher forcing inputs: [BOS, t_1, t_2, ..., t_L]
-        # Target labels for loss: [t_1, t_2, ..., t_L, EOS]
         max_len = max(len(t) for t in targets)
         batch_input_seqs = []
         batch_target_labels = []
@@ -295,4 +353,4 @@ class StaveCollate:
         batch_input_seqs = torch.stack(batch_input_seqs, dim=0)
         batch_target_labels = torch.stack(batch_target_labels, dim=0)
 
-        return batch_inputs, batch_input_seqs, batch_target_labels
+        return batch_inputs, input_lengths, batch_input_seqs, batch_target_labels
