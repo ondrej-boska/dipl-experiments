@@ -260,6 +260,28 @@ Example output (illustrative numbers):
 With several test datasets, a `Test SER <dataset> (%)` column is added for each.
 Encoder parameters of the MuSViT run exclude the frozen MuSViT backbone, and its training time excludes feature extraction.
 
+### Evaluating checkpoints on an independent dataset
+
+To compare checkpoints after changing the training splits, convert an independent
+MusiCorpus dataset to Zeus pickles and evaluate its fixed test split:
+
+```bash
+python -m musvit_zeus_comparison.evaluate_checkpoints \
+    --dataset datasets/dolores_small \
+    --checkpoint old=/models/zeus_old.pt \
+    --checkpoint new=/models/zeus_new.pt \
+    --model-type old=zeus \
+    --model-type new=zeus \
+    --device cuda \
+    --output results/dolores_small.json
+```
+
+`--model-type` defaults to `zeus`; use `musvit` for MuSViT checkpoints and
+provide the matching feature-cache options. The evaluator loads each checkpoint's
+vocabulary and hidden dimensions, evaluates `samples.test.pickle`, and reports
+SER for the same samples. A checkpoint made by incompatible model code or with
+different tensor shapes fails explicitly rather than producing a misleading score.
+
 ---
 
 ## 6. Directory Layout
