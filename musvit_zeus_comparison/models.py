@@ -1,13 +1,20 @@
 """
-Model architectures for Zeus Baseline (Run 1) and MuSViT + Zeus (Run 2).
+Model architectures for Zeus Baseline (Run 1), MuSViT + Zeus on cached features (Run 2)
+and end-to-end MuSViT + Zeus with an optionally fine-tuned backbone (Run 3).
 Shared Bahdanau Attention LSTM Decoder ensures 100% identical decoding mechanics.
 """
 
+import os
 from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from transformers import ViTModel
+except ImportError:
+    ViTModel = None
 
 
 def lengths_to_mask(lengths: torch.Tensor, max_len: int, device: torch.device) -> torch.Tensor:
@@ -371,6 +378,201 @@ class MusvitEncoder(nn.Module):
 
 
 # ==============================================================================
+# MuSViT Backbone (shared by feature extraction and Run 3)
+# ==============================================================================
+
+def load_musvit(model_name: str = "PRAIG/musvit", device: str | None = None, token: str | None = None):
+    """
+    Loads a MuSViT encoder (e.g. 'PRAIG/musvit' or 'PRAIG/musvit-light') as a plain ViTModel, as its model card
+    prescribes: AutoModel would give ViT-MAE, which randomly masks 70% of the patches.
+    """
+    if ViTModel is None:
+        raise ImportError("Please install transformers: pip install transformers")
+
+    print(f"Loading pre-trained MuSViT model '{model_name}'...")
+    hf_token = token or os.environ.get("HF_TOKEN")
+    # The MAE checkpoint has no pooler, and the pooler is unused here
+    model, loading_info = ViTModel.from_pretrained(
+        model_name, token=hf_token, add_pooling_layer=False, output_loading_info=True
+    )
+
+    # Anything missing would be randomly initialized
+    missing = [k for k in loading_info["missing_keys"] if not k.startswith("pooler.")]
+    if missing or loading_info["mismatched_keys"]:
+        raise RuntimeError(
+            f"'{model_name}' did not load cleanly into ViTModel. "
+            f"Missing weights: {missing}. Mismatched weights: {loading_info['mismatched_keys']}."
+        )
+
+    if device is not None:
+        model.to(device)
+    model.eval()
+    return model
+
+
+def stave_canvas(bands: torch.Tensor, canvas_size: int = 1024) -> torch.Tensor:
+    """
+    MuSViT's documented stave input: the stave bands (B, 3, stave_height, canvas_size) pasted at the top
+    of a white square canvas of the size MuSViT was pre-trained on -> (B, 3, canvas_size, canvas_size).
+    Built on the bands' device, so that only the bands travel from the CPU.
+    """
+    canvas = bands.new_ones(bands.shape[0], 3, canvas_size, canvas_size)  # white, as to_tensor maps 255 to 1.0
+    canvas[:, :, :bands.shape[2]] = bands
+    return canvas
+
+
+def stave_patch_grid(last_hidden_state: torch.Tensor, patch_rows: int, patch_columns: int) -> torch.Tensor:
+    """
+    Cuts the stave's features out of the ViT output.
+
+    Args:
+        last_hidden_state: (B, 1 + N, D) with the [CLS] token first and N patches in row-major order
+        patch_rows: number of top patch rows covered by the stave
+        patch_columns: number of patch columns of the ViT input
+    Returns:
+        (B, patch_rows, patch_columns, D) patch features of the stave, without any white padding rows below it
+    """
+    patches = last_hidden_state[:, 1:, :]  # drop [CLS]
+    B, N, D = patches.shape
+    if N % patch_columns != 0 or N // patch_columns < patch_rows:
+        raise ValueError(f"Expected at least {patch_rows} rows of {patch_columns} patch tokens, got {N} tokens.")
+    return patches.reshape(B, N // patch_columns, patch_columns, D)[:, :patch_rows]
+
+
+def arrange_patch_grid(grid: torch.Tensor, layout: str) -> torch.Tensor:
+    """
+    Arranges a (..., rows, columns, D) MuSViT patch grid as a sequence:
+    - 'columns': one timestep per patch column, its rows concatenated -> (..., columns, rows * D)
+    - 'raster': row-major patch sequence, as in the MuSViT documentation -> (..., rows * columns, D)
+    """
+    if layout == "columns":
+        # Like the Zeus encoder flattening H x C per column, keeps the vertical (pitch) position
+        return grid.transpose(-3, -2).flatten(-2)
+    if layout == "raster":
+        return grid.flatten(-3, -2)
+    raise ValueError(f"Unknown feature layout '{layout}'. Must be 'columns' or 'raster'.")
+
+
+class MusvitBackbone(nn.Module):
+    """
+    Pre-trained MuSViT (or another ViT on the Hugging Face Hub) applied to stave bands, trainable or frozen.
+
+    Input modes:
+    - 'canvas': the band is pasted on the white square canvas MuSViT was pre-trained on, exactly as
+      extract_features.py does; the ViT processes all canvas_size^2 / patch_size^2 patches (4096 for MuSViT).
+    - 'interpolate': the band alone is processed with interpolated position embeddings, which the MuSViT model
+      card recommends for fine-tuning; 16x fewer patches at height 64, so far cheaper to fine-tune.
+
+    While frozen, it runs without gradients and stays in eval mode even when the model is trained.
+    """
+    def __init__(
+        self,
+        model_name: str = "PRAIG/musvit",
+        stave_height: int = 64,
+        input_mode: Literal["canvas", "interpolate"] = "canvas",
+        token: str | None = None,
+        bf16: bool = False,
+        gradient_checkpointing: bool = False,
+    ):
+        super().__init__()
+        if input_mode not in ("canvas", "interpolate"):
+            raise ValueError(f"Unknown input_mode '{input_mode}'. Must be 'canvas' or 'interpolate'.")
+        self.vit = load_musvit(model_name, token=token)
+        self.model_name = model_name
+        self.input_mode = input_mode
+        self.bf16 = bf16
+        self.canvas_size = self.vit.config.image_size
+        self.patch_size = self.vit.config.patch_size
+        self.hidden_size = self.vit.config.hidden_size
+
+        if stave_height % self.patch_size != 0 or not 0 < stave_height <= self.canvas_size:
+            raise ValueError(
+                f"The stave height must be a multiple of the patch size ({self.patch_size}) "
+                f"between {self.patch_size} and {self.canvas_size}, got {stave_height}."
+            )
+        self.stave_height = stave_height
+        self.patch_rows = stave_height // self.patch_size
+
+        if gradient_checkpointing:
+            # Takes effect only while the ViT is in training mode, i.e. while fine-tuning
+            self.vit.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+        self.trainable = False
+        self.set_trainable(False)
+
+    def set_trainable(self, trainable: bool):
+        """Freezes or unfreezes the ViT weights."""
+        self.trainable = trainable
+        self.vit.requires_grad_(trainable)
+        self.train(self.training)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if not self.trainable:
+            self.vit.eval()
+        return self
+
+    def forward(self, bands: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            bands: (B, 3, stave_height, width) stave bands in [0, 1], without normalization (as documented);
+                the width must be the canvas size in 'canvas' mode and a multiple of the patch size otherwise
+        Returns:
+            (B, patch_rows, width / patch_size, hidden_size) patch grid of the staves, in FP32
+        """
+        height, width = bands.shape[-2:]
+        if height != self.stave_height or width % self.patch_size != 0:
+            raise ValueError(
+                f"Expected stave bands of height {self.stave_height} and a width divisible by {self.patch_size}, "
+                f"got {height}x{width}."
+            )
+        if self.input_mode == "canvas" and width != self.canvas_size:
+            raise ValueError(f"The 'canvas' input mode needs stave bands {self.canvas_size} px wide, got {width}.")
+
+        with (
+            torch.set_grad_enabled(self.trainable and torch.is_grad_enabled()),
+            torch.autocast(bands.device.type, dtype=torch.bfloat16, enabled=self.bf16),
+        ):
+            if self.input_mode == "canvas":
+                hidden = self.vit(stave_canvas(bands, self.canvas_size)).last_hidden_state
+            else:
+                hidden = self.vit(bands, interpolate_pos_encoding=True).last_hidden_state
+        return stave_patch_grid(hidden.float(), self.patch_rows, width // self.patch_size)
+
+
+# ==============================================================================
+# Run 3: End-to-End MuSViT Encoder (Backbone + Run 2 Adapter)
+# ==============================================================================
+
+class MusvitE2EEncoder(MusvitEncoder):
+    """
+    MuSViT backbone followed by the Run 2 adapter, taking stave bands instead of cached features.
+    Its state dict is a superset of MusvitEncoder's, so a Run 2 checkpoint initializes the adapter
+    (and the decoder) when the feature settings match, while the backbone keeps its pre-trained weights.
+    """
+    def __init__(
+        self,
+        backbone: MusvitBackbone,
+        dim: int = 256,
+        feature_layout: Literal["columns", "raster"] = "columns",
+        dropout: float = 0.2,
+    ):
+        musvit_dim = backbone.hidden_size * (backbone.patch_rows if feature_layout == "columns" else 1)
+        super().__init__(dim=dim, musvit_dim=musvit_dim, dropout=dropout)
+        self.backbone = backbone
+        self.feature_layout = feature_layout
+
+    def forward(self, bands: torch.Tensor, lengths: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Args:
+            bands: (B, 3, stave_height, width) stave bands in [0, 1]
+            lengths: ignored; all bands of a batch have the same width, so no timestep is padding
+        """
+        features = arrange_patch_grid(self.backbone(bands), self.feature_layout)
+        return super().forward(features)
+
+
+# ==============================================================================
 # Combined End-to-End OMR Model
 # ==============================================================================
 
@@ -378,11 +580,12 @@ class CombinedOMRModel(nn.Module):
     """
     Unified container wrapping either:
     - Run 1: ZeusEncoder + ZeusDecoder
-    - Run 2: MusvitEncoder + ZeusDecoder
+    - Run 2: MusvitEncoder + ZeusDecoder (pre-extracted features)
+    - Run 3: MusvitE2EEncoder + ZeusDecoder (MuSViT backbone in the model, frozen or fine-tuned)
     """
     def __init__(
         self,
-        encoder_type: Literal["zeus", "musvit"],
+        encoder_type: Literal["zeus", "musvit", "musvit_e2e"],
         vocab_size: int,
         dim: int = 256,
         timestep_width: int = 16,
@@ -393,6 +596,13 @@ class CombinedOMRModel(nn.Module):
         pad_idx: int = 2,
         max_length: int = 600,
         dropout: float = 0.2,
+        musvit_model: str = "PRAIG/musvit",
+        musvit_input: Literal["canvas", "interpolate"] = "canvas",
+        stave_height: int = 64,
+        feature_layout: Literal["columns", "raster"] = "columns",
+        hf_token: str | None = None,
+        musvit_bf16: bool = False,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.encoder_type = encoder_type.lower()
@@ -401,8 +611,18 @@ class CombinedOMRModel(nn.Module):
             self.encoder = ZeusEncoder(dim=dim, input_height=input_height, timestep_width=timestep_width, dropout=dropout)
         elif self.encoder_type == "musvit":
             self.encoder = MusvitEncoder(dim=dim, musvit_dim=musvit_dim, dropout=dropout)
+        elif self.encoder_type == "musvit_e2e":
+            backbone = MusvitBackbone(
+                model_name=musvit_model,
+                stave_height=stave_height,
+                input_mode=musvit_input,
+                token=hf_token,
+                bf16=musvit_bf16,
+                gradient_checkpointing=gradient_checkpointing,
+            )
+            self.encoder = MusvitE2EEncoder(backbone, dim=dim, feature_layout=feature_layout, dropout=dropout)
         else:
-            raise ValueError(f"Unknown encoder_type: '{encoder_type}'. Must be 'zeus' or 'musvit'.")
+            raise ValueError(f"Unknown encoder_type: '{encoder_type}'. Must be 'zeus', 'musvit' or 'musvit_e2e'.")
 
         # In Zeus, all model dropout is localized in the encoder; decoder has 0 dropout
         self.decoder = ZeusDecoder(
@@ -414,6 +634,11 @@ class CombinedOMRModel(nn.Module):
             max_length=max_length,
             dropout=0.0,
         )
+
+    @property
+    def backbone(self) -> MusvitBackbone | None:
+        """The pre-trained MuSViT backbone of Run 3, or None."""
+        return getattr(self.encoder, "backbone", None)
 
     def forward(self, x: torch.Tensor, target_seq: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
         context, ctx_mask = self.encoder(x, lengths)

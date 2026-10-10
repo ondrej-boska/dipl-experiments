@@ -6,6 +6,8 @@ Follows the Zeus repository workflow:
   Each split (train / dev / test) can combine any datasets found in the dataset directory.
 - Run 1 (Zeus Baseline): CNN-BiLSTM Encoder + Zeus Bahdanau Attention Decoder (trained from scratch).
 - Run 2 (MuSViT + Zeus): Pre-trained MuSViT Vision Transformer Feature Extractor + Zeus Decoder.
+- Run 3 (end-to-end MuSViT + Zeus): the Run 2 model with the MuSViT backbone inside, reading stave images
+  instead of cached features; the backbone is frozen, or fine-tuned from a given epoch on.
 - Evaluation: Symbol Error Rate (SER) computed directly with zeus.evaluation.symbol_error_rate.
 - Exports results to Markdown and CSV summary tables, merging concurrent SLURM runs.
 """
@@ -27,6 +29,7 @@ from torch.utils.data import DataLoader
 
 try:
     from musvit_zeus_comparison.zeus.evaluation.symbol_error_rate import symbol_error_rate
+    from musvit_zeus_comparison.augmentation import ZeusAugmentation
     from musvit_zeus_comparison.dataset import (
         LengthBucketBatchSampler,
         StaveCollate,
@@ -40,6 +43,7 @@ try:
     from musvit_zeus_comparison.models import CombinedOMRModel
 except ImportError:
     from zeus.evaluation.symbol_error_rate import symbol_error_rate
+    from augmentation import ZeusAugmentation
     from dataset import (
         LengthBucketBatchSampler,
         StaveCollate,
@@ -56,6 +60,7 @@ except ImportError:
 RUN_INFO = {
     "zeus": {"model": "Zeus Baseline (Run 1)", "encoder": "CNN-BiLSTM"},
     "musvit": {"model": "MuSViT + Zeus (Run 2)", "encoder": "MuSViT + Adapter"},
+    "musvit_e2e": {"model": "MuSViT E2E + Zeus (Run 3)", "encoder": "MuSViT (in model) + Adapter"},
 }
 
 
@@ -95,16 +100,63 @@ def learning_rate_at(epoch: int, args: argparse.Namespace) -> float:
     return min_lr + (args.learning_rate - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def finetunes_backbone(epoch: int, args: argparse.Namespace) -> bool:
+    """Whether the MuSViT backbone of Run 3 is trained in a (1-based) epoch."""
+    return args.finetune_from is not None and epoch >= args.finetune_from
+
+
+def backbone_learning_rate_at(epoch: int, args: argparse.Namespace, progress: float = 1.0) -> float:
+    """
+    Learning rate of the MuSViT backbone after `progress` (0-1] of a (1-based) epoch: 0 while frozen, then
+    --finetune-lr scaled by the same schedule as the rest of the model, so that it decays along with it.
+    During the first --finetune-warmup-epochs of fine-tuning, it rises linearly from 0, step by step, so that
+    the first updates of the pre-trained weights, made before Adam's moment estimates settle, stay small.
+    """
+    if not finetunes_backbone(epoch, args):
+        return 0.0
+    lr = args.finetune_lr * learning_rate_at(epoch, args) / args.learning_rate
+    if args.finetune_warmup_epochs > 0:
+        lr *= min(1.0, (epoch - args.finetune_from + progress) / args.finetune_warmup_epochs)
+    return lr
+
+
+def in_backbone_warmup(epoch: int, args: argparse.Namespace) -> bool:
+    """Whether the backbone learning rate rises during this epoch, so it is set at every step."""
+    return finetunes_backbone(epoch, args) and epoch - args.finetune_from < args.finetune_warmup_epochs
+
+
+def load_initial_weights(model: CombinedOMRModel, state_dict: dict):
+    """
+    Loads the weights of another training run (--init-from). A Run 2 checkpoint (cached features) has no
+    backbone, which then keeps its pre-trained weights; all other weights must match.
+    """
+    result = model.load_state_dict(state_dict, strict=False)
+    missing = [k for k in result.missing_keys if not k.startswith("encoder.backbone.")]
+    if missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"The --init-from checkpoint does not fit the '{model.encoder_type}' model. "
+            f"Missing weights: {missing}. Unexpected weights: {result.unexpected_keys}."
+        )
+    if model.backbone is not None:
+        source = "pre-trained (not in the checkpoint)" if result.missing_keys else "from the checkpoint"
+        print(f"Initialized the model from the checkpoint; MuSViT backbone weights: {source}.")
+
+
 def make_loader(dataset: StaveOMRDataset, args: argparse.Namespace, shuffle: bool) -> DataLoader:
     """
     Batches samples of similar transcription length (see LengthBucketBatchSampler).
     Unshuffled (evaluation) loaders iterate in length order, not dataset order.
+    Shuffled (training) loaders augment the samples if the dataset has an augmentation.
     """
     vocab = dataset.vocab
     return DataLoader(
         dataset,
         batch_sampler=LengthBucketBatchSampler(
-            dataset.target_lengths(), args.batch_size, shuffle=shuffle, pool_batches=args.length_bucket_batches
+            dataset.target_lengths(),
+            args.batch_size,
+            shuffle=shuffle,
+            pool_batches=args.length_bucket_batches,
+            sample_seeds=shuffle and dataset.augmentation is not None,
         ),
         collate_fn=StaveCollate(pad_idx=vocab.pad_idx, bos_idx=vocab.bos_idx, eos_idx=vocab.eos_idx),
         num_workers=args.num_workers,
@@ -251,9 +303,13 @@ def train_single_model(
     device: torch.device,
     test_dataset: StaveOMRDataset | None = None,
     checkpoint: dict | None = None,
+    init_checkpoint: dict | None = None,
     musvit_dim: int = 768,
 ) -> dict:
-    """Trains either Run 1 ('zeus') or Run 2 ('musvit') and returns metrics summary."""
+    """
+    Trains Run 1 ('zeus'), Run 2 ('musvit') or Run 3 ('musvit_e2e') and returns metrics summary.
+    `checkpoint` resumes a run exactly; `init_checkpoint` only provides the initial weights of a new run.
+    """
     print("\n=======================================================")
     print(f" Starting Training: {RUN_INFO[model_type]['model']}")
     print("=======================================================")
@@ -276,12 +332,21 @@ def train_single_model(
         pad_idx=vocab.pad_idx,
         max_length=args.max_gen_length,
         dropout=args.dropout,
+        musvit_model=args.musvit_model,
+        musvit_input=args.musvit_input,
+        stave_height=args.feature_stave_height,
+        feature_layout=args.feature_layout,
+        hf_token=args.hf_token,
+        musvit_bf16=args.musvit_bf16,
+        gradient_checkpointing=args.grad_checkpointing,
     ).to(device)
+    backbone = model.backbone
 
     enc_params = sum(p.numel() for p in model.encoder.parameters())
     dec_params = sum(p.numel() for p in model.decoder.parameters())
     total_params = enc_params + dec_params
-    print(f"Parameters: Encoder: {enc_params:,} | Decoder: {dec_params:,} | Total: {total_params:,}")
+    backbone_str = f" (MuSViT backbone: {sum(p.numel() for p in backbone.parameters()):,})" if backbone is not None else ""
+    print(f"Parameters: Encoder: {enc_params:,}{backbone_str} | Decoder: {dec_params:,} | Total: {total_params:,}")
 
     output_dir = Path(args.output_dir)
     latest_path = output_dir / f"{model_type}_latest.pt"
@@ -292,12 +357,19 @@ def train_single_model(
 
     criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
 
-    # Optimizer matching TensorFlow Zeus specification; the fused CUDA kernel updates all parameters at once
+    # Optimizer matching TensorFlow Zeus specification; the fused CUDA kernel updates all parameters at once.
+    # The MuSViT backbone gets a second parameter group with its own learning rate, from the start, so that the
+    # optimizer state keeps one layout whether the backbone is frozen or not (frozen weights get no gradients,
+    # which the optimizer skips).
+    backbone_ids = {id(p) for p in backbone.parameters()} if backbone is not None else set()
+    param_groups = [{"params": [p for p in model.parameters() if id(p) not in backbone_ids]}]
+    if backbone is not None:
+        param_groups.append({"params": list(backbone.parameters())})
     fused = device.type == "cuda"
     if args.optimizer == "adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, eps=1e-7, fused=fused)
+        optimizer = torch.optim.Adam(param_groups, lr=args.learning_rate, eps=1e-7, fused=fused)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, fused=fused)
+        optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate, weight_decay=args.weight_decay, fused=fused)
 
     # The checkpoint is selected by validation SER; by validation loss only when SER is never evaluated
     select_by = "ser" if args.evaluation_each > 0 else "val_loss"
@@ -322,6 +394,13 @@ def train_single_model(
                 "and the best-so-far record is unknown, so the next evaluated epoch becomes the best checkpoint."
             )
         print(f"Resumed from epoch {start_epoch - 1}.")
+        if backbone is not None and history and history[-1].get("backbone_lr") and not finetunes_backbone(start_epoch, args):
+            print(
+                f"Warning: the backbone was fine-tuned before epoch {start_epoch}, "
+                f"but stays frozen from now on, since --finetune-from is not given or is later."
+            )
+    elif init_checkpoint is not None:
+        load_initial_weights(model, init_checkpoint["model"])
 
     if args.eval_only:
         start_epoch = args.epochs + 1  # skip the training loop
@@ -333,16 +412,27 @@ def train_single_model(
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
         lr = learning_rate_at(epoch, args)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
+        optimizer.param_groups[0]["lr"] = lr
+        backbone_lr = None
+        if backbone is not None:
+            backbone_lr = backbone_learning_rate_at(epoch, args)
+            optimizer.param_groups[1]["lr"] = backbone_lr
+            if finetunes_backbone(epoch, args) != backbone.trainable:
+                print(f"Epoch {epoch}: {'unfreezing' if finetunes_backbone(epoch, args) else 'freezing'} the MuSViT backbone.")
+            backbone.set_trainable(finetunes_backbone(epoch, args))
 
         model.train()
         # Accumulated on the device, so that the CPU does not wait for the GPU after every batch
         train_loss_sum = torch.zeros((), device=device)
         train_tokens = torch.zeros((), dtype=torch.long, device=device)
 
-        for batch in train_loader:
+        warmup = backbone is not None and in_backbone_warmup(epoch, args)
+        steps = len(train_loader)
+        for step, batch in enumerate(train_loader):
             inputs, lengths, input_seqs, targets = to_device(batch, device)
+            if warmup:
+                backbone_lr = backbone_learning_rate_at(epoch, args, (step + 1) / steps)
+                optimizer.param_groups[1]["lr"] = backbone_lr
 
             optimizer.zero_grad()
             logits = model(inputs, input_seqs, lengths)  # (B, L, V)
@@ -376,6 +466,8 @@ def train_single_model(
             "ser": current_ser,
             "sec": time.time() - epoch_start,
         }
+        if backbone_lr is not None:
+            record["backbone_lr"] = backbone_lr
         history.append(record)
         train_time = prior_train_time + time.time() - start_time
 
@@ -393,9 +485,10 @@ def train_single_model(
             )
 
         ser_str = f" | Val SER: {current_ser:.2f}%" if current_ser is not None else ""
+        backbone_lr_str = f" | Backbone LR: {backbone_lr:.2e}" if backbone_lr else ""
         print(
             f"Epoch {epoch:02d}/{args.epochs:02d} | "
-            f"LR: {lr:.2e} | "
+            f"LR: {lr:.2e}{backbone_lr_str} | "
             f"Train Loss: {train_loss:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
             f"Token Acc: {token_acc:.2f}%"
@@ -590,8 +683,9 @@ def main():
         "--model",
         type=str,
         default="compare",
-        choices=["zeus", "musvit", "compare"],
-        help="Select 'zeus' (Run 1), 'musvit' (Run 2), or 'compare' (runs both consecutively).",
+        choices=["zeus", "musvit", "musvit_e2e", "compare"],
+        help="Select 'zeus' (Run 1), 'musvit' (Run 2, cached features), 'musvit_e2e' (Run 3, MuSViT inside the model, "
+             "optionally fine-tuned), or 'compare' (runs 'zeus' and 'musvit' consecutively).",
     )
     # Dataset selection: every split uses the datasets' own predefined splits
     parser.add_argument("--dataset-dir", type=str, default="datasets", help="Directory containing the datasets as subfolders (default: datasets).")
@@ -618,10 +712,21 @@ def main():
              + " Pass --test without values to skip testing.",
     )
     parser.add_argument("--feature-cache-dir", type=str, default="feature_cache", help="Directory of pre-extracted MuSViT features.")
-    parser.add_argument("--feature-stave-height", type=int, default=64, help="Stave height the MuSViT features were extracted with (extract_features.py --stave-height).")
+    parser.add_argument("--feature-stave-height", "--stave-height", dest="feature_stave_height", type=int, default=64, help="Stave height the MuSViT features were extracted with (extract_features.py --stave-height), or that musvit_e2e resizes staves to.")
     parser.add_argument("--feature-layout", type=str, default="columns", choices=["columns", "raster"], help="Sequence made of the MuSViT patch grid: one timestep per patch column with its rows concatenated ('columns'), or the row-major patch sequence of the MuSViT documentation ('raster').")
     parser.add_argument("--feature-precision", type=str, default="float16", choices=["float16", "float32"], help="Precision the MuSViT features were extracted with.")
     parser.add_argument("--preload-features", action="store_true", help="Read all MuSViT feature files into RAM once (~0.4 MB per stave at height 64) instead of from disk in every epoch; helps on slow (e.g. network) filesystems.")
+    # Run 3 (musvit_e2e): MuSViT backbone inside the model
+    parser.add_argument("--musvit-model", type=str, default="PRAIG/musvit", help="Hugging Face ID of the ViT backbone of musvit_e2e, e.g. 'PRAIG/musvit' or 'PRAIG/musvit-light' (loaded as a plain ViTModel).")
+    parser.add_argument("--musvit-input", type=str, default="canvas", choices=["canvas", "interpolate"], help="How musvit_e2e feeds stave bands to the backbone: pasted on the white 1024x1024 canvas, exactly as extract_features.py ('canvas'), or alone with interpolated position embeddings, which the MuSViT model card recommends for fine-tuning and which processes 16x fewer patches at height 64 ('interpolate').")
+    parser.add_argument("--stave-width", type=int, default=1024, help="Width musvit_e2e resizes staves to; must be the canvas size (1024) with --musvit-input canvas.")
+    parser.add_argument("--finetune-from", type=int, default=None, metavar="EPOCH", help="Fine-tune the musvit_e2e backbone from this (1-based) epoch on, frozen before; 1 fine-tunes from the start. Applies to resumed runs as well, e.g. resuming a frozen run at epoch 100 with --finetune-from 101. Default: frozen throughout.")
+    parser.add_argument("--finetune-lr", type=float, default=1e-5, help="Learning rate of the backbone while fine-tuning, at the schedule's peak; it follows the --lr-decay schedule of --learning-rate, scaled.")
+    parser.add_argument("--finetune-warmup-epochs", type=float, default=5, help="The backbone learning rate rises linearly from 0 over this many epochs (fractions allowed) after unfreezing, updated at every step; 0 disables the warmup.")
+    parser.add_argument("--musvit-bf16", action="store_true", help="Run the musvit_e2e backbone in bfloat16 autocast (Ampere+ GPUs): much faster and less memory, slightly less precise.")
+    parser.add_argument("--grad-checkpointing", action="store_true", help="Recompute the backbone's activations in the backward pass instead of storing them, to fine-tune with less GPU memory at ~30%% more compute.")
+    parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face token for the gated MuSViT models (default: the HF_TOKEN environment variable).")
+    parser.add_argument("--init-from", type=str, default=None, help="Start a new training run (epoch 1, fresh optimizer) from the weights of this checkpoint. For musvit_e2e, a 'musvit' (Run 2) checkpoint with matching feature settings initializes the adapter and decoder, and the backbone keeps its pre-trained weights. Ignored when a checkpoint is resumed.")
     parser.add_argument("--output-dir", type=str, default="experiment_results", help="Directory to save logs, checkpoints and tables.")
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs (Zeus default: 400-500).")
     parser.add_argument("--batch-size", type=int, default=32, help="Training batch size (Zeus default: 32 or 64).")
@@ -634,6 +739,7 @@ def main():
     parser.add_argument("--image-height", type=int, default=96, help="Height stave images are scaled to for the Zeus encoder.")
     parser.add_argument("--max-image-width", type=int, default=1536, help="Maximum width of stave images after scaling.")
     parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate (default: 0.2 matching solo26).")
+    parser.add_argument("--augment", type=str, default="", help="Training image augmentation, as Zeus --augment, e.g. 'h:8,rotate:1,v:4,de,en3:0.2,n:0.01,c:-1:1,b:-0.5:0.2' (see augmentation.py); pixel amounts refer to the model's input image. For 'zeus' and 'musvit_e2e'. Default: none.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
     parser.add_argument("--length-bucket-batches", type=int, default=50, help="Training batches are formed from pools of this many batches sorted by transcription length, so that a batch holds similar lengths and the decoder wastes few steps on padding; 1 gives plain random batches.")
@@ -649,6 +755,18 @@ def main():
     args = parser.parse_args()
     if args.model == "compare" and args.resume and args.resume.lower() != "auto":
         parser.error("--resume with a checkpoint path needs a single --model; use --resume auto with --model compare.")
+    if args.model == "compare" and args.init_from:
+        parser.error("--init-from needs a single --model.")
+    if args.finetune_from is not None and args.finetune_from < 1:
+        parser.error("--finetune-from must be an epoch >= 1.")
+    if args.finetune_warmup_epochs < 0:
+        parser.error("--finetune-warmup-epochs must be >= 0.")
+    if args.augment and args.model in ("musvit", "compare"):
+        parser.error("--augment cannot augment the pre-extracted features of 'musvit'; use 'zeus' or 'musvit_e2e'.")
+    try:
+        ZeusAugmentation(args.augment)
+    except ValueError as e:
+        parser.error(f"--augment: {e}")
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Active Device: {device}")
@@ -677,8 +795,8 @@ def main():
             f"  python -m musvit_zeus_comparison.zeus pickle {args.dataset_dir}/<name>/samples.*.txt"
         )
 
-    # The MuSViT run alone reads pre-extracted features and never needs the images
-    keep_images = "zeus" in models_to_run
+    # The cached-feature MuSViT run alone reads pre-extracted features and never needs the images
+    keep_images = any(m != "musvit" for m in models_to_run)
     print("Loading training datasets...")
     train_samples = load_split(train_specs, args.dataset_dir, "train", keep_images)
     print("Loading validation datasets...")
@@ -727,10 +845,18 @@ def main():
         if checkpoint_path is not None:
             print(f"Loading checkpoint from: {checkpoint_path}")
             checkpoint = load_checkpoint(checkpoint_path)
+        init_checkpoint = None
+        if args.init_from and not args.eval_only:
+            if checkpoint is not None:
+                print(f"Resuming '{checkpoint_path}', so --init-from '{args.init_from}' is ignored.")
+            else:
+                print(f"Initializing weights from: {args.init_from}")
+                init_checkpoint = load_checkpoint(Path(args.init_from))
 
         # 2. Vocabulary from the training split (matching Zeus TokenMap), or the checkpoint's exact mapping
-        if checkpoint is not None:
-            vocab = TokenVocabulary.from_dict(checkpoint["vocab"])
+        vocab_source = checkpoint or init_checkpoint
+        if vocab_source is not None:
+            vocab = TokenVocabulary.from_dict(vocab_source["vocab"])
             unknown = {t for s in all_train for t in s.lmx.split()} - vocab.token2id.keys()
             if unknown:
                 print(f"Warning: {len(unknown):,} training token type(s) are not in the checkpoint's vocabulary and map to <unk>.")
@@ -748,8 +874,10 @@ def main():
             preload_features=args.preload_features,
             image_height=args.image_height,
             max_image_width=args.max_image_width,
+            stave_height=args.feature_stave_height,
+            stave_width=args.stave_width,
         )
-        train_ds = StaveOMRDataset(train_samples, **dataset_kwargs)
+        train_ds = StaveOMRDataset(train_samples, **dataset_kwargs, augment=args.augment)
         val_ds = StaveOMRDataset(val_samples, **dataset_kwargs)
         test_ds = StaveOMRDataset(test_samples, **dataset_kwargs) if test_samples else None
 
@@ -764,9 +892,14 @@ def main():
             device=device,
             test_dataset=test_ds,
             checkpoint=checkpoint,
+            init_checkpoint=init_checkpoint,
             musvit_dim=musvit_dim,
         )
         res["datasets"] = selection
+        res["augment"] = args.augment
+        if m == "musvit_e2e":
+            tuning = f"fine-tuned from epoch {args.finetune_from}" if args.finetune_from is not None else "frozen"
+            res["encoder"] = f"{args.musvit_model} ({args.musvit_input}, {tuning}) + Adapter"
 
         # 3. Export after every run, so that a finished run is never lost to a failure of the next one
         export_results_table([res], args.output_dir)

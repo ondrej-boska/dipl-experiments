@@ -6,11 +6,13 @@ Follows the Zeus repository workflow:
   each with its own predefined splits pickled by Zeus (samples.{train,dev,test}.pickle).
 - Run 1 (Zeus Baseline): decodes raw image bytes in-memory with aspect-ratio preserving scaling.
 - Run 2 (MuSViT + Zeus): loads pre-extracted feature embeddings from feature_cache.
+- Run 3 (end-to-end MuSViT + Zeus): decodes raw image bytes into stave bands, prepared as for feature extraction.
 - Ground truth: tokenized directly from sample.lmx strings.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import math
 from pathlib import Path
@@ -18,13 +20,28 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import Dataset, Sampler
+from torchvision.transforms.functional import to_tensor
 from tqdm import tqdm
 
 try:
+    from musvit_zeus_comparison.augmentation import ZeusAugmentation
+    from musvit_zeus_comparison.models import arrange_patch_grid
     from musvit_zeus_comparison.zeus.data.zeus_dataset import ZeusDataset, ZeusDatasetSample
 except ImportError:
+    from augmentation import ZeusAugmentation
+    from models import arrange_patch_grid
     from zeus.data.zeus_dataset import ZeusDataset, ZeusDatasetSample
+
+
+def prepare_stave_band(image: Image.Image, width: int = 1024, height: int = 64) -> torch.Tensor:
+    """
+    The stave resized to `width` x `height` (by default the full MuSViT canvas width), as in the MuSViT documentation.
+    Returns a (3, height, width) tensor in [0, 1], without normalization (as documented).
+    Shared by feature extraction and end-to-end training, so that both see identical inputs.
+    """
+    return to_tensor(image.convert("RGB").resize((width, height)))
 
 
 # ==============================================================================
@@ -224,22 +241,32 @@ class StaveOMRDataset(Dataset):
     Dataset backed directly by in-memory ZeusDatasetSample objects.
     - Run 1 ('zeus'): decodes sample.image bytes into normalized grayscale tensor (1, H, W).
     - Run 2 ('musvit'): loads the pre-extracted (rows, columns, dim) MuSViT patch grid from feature_cache_dir
-      and arranges it as a sequence:
+      and arranges it as a sequence (see models.arrange_patch_grid):
         - 'columns': one timestep per patch column, its rows concatenated -> (columns, rows * dim)
         - 'raster': row-major patch sequence, as in the MuSViT documentation -> (rows * columns, dim)
+    - Run 3 ('musvit_e2e'): decodes sample.image bytes into a (3, stave_height, stave_width) RGB stave band
+      in [0, 1], for the MuSViT backbone inside the model.
     - Targets: tokenized from sample.lmx string.
+
+    With `augment` (a Zeus augmentation pipeline, see augmentation.py), images and stave bands are augmented
+    when an item is requested as (index, seed), as the training sampler does (LengthBucketBatchSampler with
+    sample_seeds); a plain index gives the unaugmented sample. The seed makes the augmentation independent of the
+    DataLoader workers, so that resumed training sees the same augmentations as an uninterrupted run.
     """
     def __init__(
         self,
         samples: SplitSamples,
         vocab: TokenVocabulary,
-        mode: str = "zeus",  # 'zeus' or 'musvit'
+        mode: str = "zeus",  # 'zeus', 'musvit' or 'musvit_e2e'
         feature_cache_dir: str | Path | None = None,
         feature_variant: str = "stave64_float16",
         feature_layout: str = "columns",  # 'columns' or 'raster'
         preload_features: bool = False,
         image_height: int = 96,  # Zeus single-staff standard height
         max_image_width: int = 1536,
+        stave_height: int = 64,  # MuSViT stave band height ('musvit_e2e')
+        stave_width: int = 1024,  # MuSViT stave band width ('musvit_e2e')
+        augment: str = "",  # Zeus augmentation pipeline, e.g. 'h:8,rotate:1,v:4'
     ):
         self.items = [(name, sample) for name, dataset_samples in samples.items() for sample in dataset_samples]
         self.vocab = vocab
@@ -249,11 +276,19 @@ class StaveOMRDataset(Dataset):
         self.feature_layout = feature_layout
         self.image_height = image_height
         self.max_image_width = max_image_width
+        self.stave_height = stave_height
+        self.stave_width = stave_width
 
+        if self.mode not in ("zeus", "musvit", "musvit_e2e"):
+            raise ValueError(f"Unknown mode '{mode}'. Must be 'zeus', 'musvit' or 'musvit_e2e'.")
         if self.mode == "musvit" and feature_cache_dir is None:
             raise ValueError("feature_cache_dir must be specified for mode='musvit'.")
         if feature_layout not in ("columns", "raster"):
             raise ValueError(f"Unknown feature_layout '{feature_layout}'. Must be 'columns' or 'raster'.")
+        if augment and self.mode == "musvit":
+            raise ValueError("Pre-extracted MuSViT features cannot be augmented; use mode 'musvit_e2e'.")
+        # Stave bands have a fixed width, which the horizontal shift must keep
+        self.augmentation = ZeusAugmentation(augment, keep_width=self.mode == "musvit_e2e") if augment else None
 
         # Reading every feature file once up front, instead of in every epoch, spares slow (e.g. network) filesystems
         self.features: list[torch.Tensor] | None = None
@@ -309,21 +344,31 @@ class StaveOMRDataset(Dataset):
         tensor = torch.from_numpy(resized).float().unsqueeze(0) / 255.0
         return tensor
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, item: int | tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """`item` is a sample index, or an (index, seed) pair to augment the sample with that seed."""
+        idx, seed = item if isinstance(item, tuple) else (item, None)
         _, sample = self.items[idx]
         token_tensor = torch.tensor(self.vocab.encode(sample.lmx.split()), dtype=torch.long)
 
         if self.mode == "musvit":
-            grid = self._load_grid(idx).float()
-            rows, columns, dim = grid.shape
-            if self.feature_layout == "columns":
-                # Like the Zeus encoder flattening H x C per column, keeps the vertical (pitch) position
-                feat = grid.permute(1, 0, 2).reshape(columns, rows * dim)
-            else:
-                feat = grid.reshape(rows * columns, dim)
-            return feat, token_tensor
+            return arrange_patch_grid(self._load_grid(idx).float(), self.feature_layout), token_tensor
 
-        return self._load_image(sample.image, sample.sample_name), token_tensor
+        if self.mode == "musvit_e2e":
+            image = self._load_stave_band(sample.image, sample.sample_name)
+        else:
+            image = self._load_image(sample.image, sample.sample_name)
+
+        # Last step before the model, as in Zeus
+        if self.augmentation is not None and seed is not None:
+            image = self.augmentation(image, torch.Generator().manual_seed(seed))
+        return image, token_tensor
+
+    def _load_stave_band(self, image_bytes: bytes, sample_name: str) -> torch.Tensor:
+        """Stave band for the MuSViT backbone (Run 3), prepared exactly as extract_features.py does."""
+        try:
+            return prepare_stave_band(Image.open(io.BytesIO(image_bytes)), self.stave_width, self.stave_height)
+        except OSError as e:
+            raise ValueError(f"Could not decode the image of sample '{sample_name}': {e}") from e
 
 
 # ==============================================================================
@@ -342,7 +387,7 @@ class StaveCollate:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
-            inputs: (B, 1, H, W_max) images padded with white, or (B, T_max, D) features padded with zeros
+            inputs: (B, C, H, W_max) images or stave bands padded with white, or (B, T_max, D) features padded with zeros
             input_lengths: (B,) unpadded widths (images) or sequence lengths (features)
             input_seqs: (B, L+1) teacher forcing inputs [BOS, t_1, ..., t_L]
             target_labels: (B, L+1) labels for loss [t_1, ..., t_L, EOS]
@@ -400,12 +445,20 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
     - shuffle=True: samples are shuffled, sorted by length within pools of `pool_batches` batches,
       cut into batches, and the batches are shuffled. A pool of 1 batch means plain random batches.
     - shuffle=False: batches follow the length order, deterministically (for evaluation).
+
+    With `sample_seeds` (shuffle only), every sample comes as an (index, seed) pair, the seed for augmenting it.
+    The seeds are drawn after the batches are formed, so that the batches are the same as without them.
     """
-    def __init__(self, lengths: list[int], batch_size: int, shuffle: bool, pool_batches: int = 50):
+    def __init__(
+        self, lengths: list[int], batch_size: int, shuffle: bool, pool_batches: int = 50, sample_seeds: bool = False
+    ):
+        if sample_seeds and not shuffle:
+            raise ValueError("Sample seeds are only drawn for shuffled (training) batches.")
         self.lengths = lengths
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.pool_batches = max(1, pool_batches)
+        self.sample_seeds = sample_seeds
 
     def _batches(self, order: list[int]) -> list[list[int]]:
         return [order[i:i + self.batch_size] for i in range(0, len(order), self.batch_size)]
@@ -425,7 +478,11 @@ class LengthBucketBatchSampler(Sampler[list[int]]):
             pool = sorted(permutation[start:start + pool_size], key=self.lengths.__getitem__)
             batches.extend(self._batches(pool))
         for i in torch.randperm(len(batches), generator=generator).tolist():
-            yield batches[i]
+            batch = batches[i]
+            if self.sample_seeds:
+                seeds = torch.randint(2**62, (len(batch),), generator=generator).tolist()
+                batch = list(zip(batch, seeds, strict=True))
+            yield batch
 
     def __len__(self) -> int:
         return math.ceil(len(self.lengths) / self.batch_size)

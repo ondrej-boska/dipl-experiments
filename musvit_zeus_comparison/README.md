@@ -220,6 +220,58 @@ With `--model compare`, the results are exported after each run, so a finished Z
 - `columns` (default): one timestep per patch column, with the rows of that column concatenated, i.e. `(64, rows x 768)`. This keeps the vertical position (pitch) of every patch, like the Zeus encoder flattening height x channels per column.
 - `raster`: the row-major patch sequence of the MuSViT documentation (`flatten(1, 2)`), i.e. `(rows x 64, 768)`.
 
+#### Run 3: End-to-End MuSViT + Zeus (frozen or fine-tuned backbone)
+`--model musvit_e2e` puts the MuSViT backbone inside the model, with the Run 2 adapter and the Zeus decoder on top. It reads the stave images instead of cached features, so no extraction is needed, and the backbone can be fine-tuned. Image augmentation can later go in the dataset as well.
+
+```bash
+# Frozen for 100 epochs, then fine-tuned with a 1e-5 peak learning rate:
+python -m musvit_zeus_comparison.train \
+    --model musvit_e2e \
+    --datasets omniomr \
+    --musvit-model PRAIG/musvit-light \
+    --musvit-input interpolate \
+    --finetune-from 101 \
+    --finetune-lr 1e-5 \
+    --musvit-bf16 \
+    --output-dir experiment_results_e2e
+```
+
+| Flag | Meaning |
+| :--- | :--- |
+| `--musvit-model ID` | Hugging Face ID of the backbone: `PRAIG/musvit` (default), `PRAIG/musvit-light`, or another ViT, loaded as a plain `ViTModel`. |
+| `--musvit-input canvas\|interpolate` | `canvas` (default) pastes the stave band on the white 1024x1024 canvas exactly as `extract_features.py` does, so a frozen backbone computes the Run 2 features. `interpolate` feeds the band alone with interpolated position embeddings, which the MuSViT model card recommends for fine-tuning. At height 64 that is 256 patches instead of 4096, so it is far cheaper. |
+| `--stave-height`, `--stave-width` | Size the staves are resized to (default 64 x 1024). The width must be 1024 with `canvas`. |
+| `--feature-layout` | Same as in Run 2. |
+| `--finetune-from EPOCH` | The backbone trains from this epoch on and stays frozen before it; `1` fine-tunes from the start. Default: frozen throughout. |
+| `--finetune-lr LR` | Peak learning rate of the backbone (default `1e-5`). It follows the `--lr-decay` schedule, scaled, and is 0 while frozen. |
+| `--finetune-warmup-epochs N` | After unfreezing, the backbone learning rate rises linearly from 0 over N epochs (default 5; fractions allowed; `0` disables). It is updated at every step. |
+| `--musvit-bf16` | Runs the backbone in bfloat16 autocast: much faster and lighter on Ampere+ GPUs. |
+| `--grad-checkpointing` | Recomputes backbone activations in the backward pass, saving GPU memory while fine-tuning. |
+| `--init-from CKPT` | Starts a new run (epoch 1, fresh optimizer) from a checkpoint's weights. A `musvit` (Run 2) checkpoint with matching feature settings initializes the adapter and decoder; the backbone keeps its pre-trained weights. |
+| `--hf-token` | Token for the gated MuSViT models (default: `HF_TOKEN`). |
+
+Ways to start fine-tuning:
+- **From scratch, fine-tuning from epoch N:** `--finetune-from N`.
+- **Resuming a run with fine-tuning on:** e.g. a frozen run stopped at epoch 100, continued with `--resume auto --finetune-from 101`. This gives the same result as an uninterrupted run with `--finetune-from 101`. A warning is printed if a run that was already fine-tuned is resumed without `--finetune-from`.
+- **From a trained Run 2 model:** `--init-from experiment_results/musvit_best.pt --finetune-from 1`, usually with a lower `--learning-rate` for the adapter and decoder.
+
+The backbone has its own optimizer parameter group from the start, so frozen and fine-tuned checkpoints share one layout. The checkpoints include the backbone, which makes them much larger (~350 MB for MuSViT, about 3x that with the Adam state once fine-tuned). Without `--model compare`, results go to `musvit_e2e_results.json` and are merged into the results table. Use a separate `--output-dir` for each backbone or setting, since they share the `musvit_e2e_*` file names.
+
+`run_musvit_e2e.slurm` in the repository root trains Run 3 from scratch for 1000 epochs. It uses `interpolate` input, Zeus augmentation and bf16, and fine-tunes from epoch 101. Each job resumes from the latest checkpoint, so the run is submitted as a chain of jobs (see the script's header).
+
+### Image Augmentation
+`--augment` augments the training images of `zeus` and `musvit_e2e` the way the TensorFlow Zeus does, with the same syntax:
+
+```bash
+--augment "h:8,rotate:1,v:4,de,en3:0.2,n:0.01,c:-1:1,b:-0.5:0.2"
+```
+
+It is a comma-separated pipeline of filters, each applied with a 50:50 chance: horizontal shift, rotation, vertical shift, dilatation/erosion, boundary noise, global noise, contrast and brightness (see `augmentation.py` and Zeus's `docs/augmentations.md`). The default is no augmentation, so existing runs stay unchanged.
+- As in Zeus, augmentation is the last step before the model, so the pixel amounts refer to the model's input: the 96 px high Zeus image, or the 64 x 1024 stave band of `musvit_e2e`.
+- On the fixed-width stave bands, the horizontal shift moves the content by the same amount, but pads or crops the right side so that the width stays. Zeus instead lets the width change.
+- Each training sample gets its own seed from the batch sampler, whose state is saved in checkpoints. So augmented training resumes exactly as well, for any `--num-workers`.
+- Pre-extracted features (`musvit`) cannot be augmented.
+
 ### Training Speed
 The following are on by default and do not change what is computed (beyond floating-point rounding):
 - **Length-bucketed batches:** the decoder runs for the longest transcription of a batch, so training batches are formed from pools of `--length-bucket-batches` (default 50) batches sorted by transcription length, and the batches are then shuffled. On the OmniOMR + Dolores length distribution, this cuts the decoder steps spent on padding from about 50% to a few percent. `--length-bucket-batches 1` gives plain random batches. Evaluation batches are sorted by length, and predictions are put back in dataset order.
@@ -267,7 +319,8 @@ Encoder parameters of the MuSViT run exclude the frozen MuSViT backbone, and its
 ```
 musvit_zeus_comparison/
 ├── __init__.py          # Package exports
-├── models.py            # ZeusEncoder, MusvitEncoder, ZeusDecoder, CombinedOMRModel
+├── models.py            # ZeusEncoder, MusvitEncoder, MusvitBackbone, MusvitE2EEncoder, ZeusDecoder, CombinedOMRModel
+├── augmentation.py      # Zeus training image augmentation (--augment), ported from TensorFlow
 ├── dataset.py           # In-memory ZeusDatasetSample loader, TokenVocabulary, StaveCollate
 ├── extract_features.py  # MuSViT feature extractor (padded 1024x1024 canvas, stave patch rows, FP16)
 ├── train.py             # Main trainer & evaluator with automated table generation

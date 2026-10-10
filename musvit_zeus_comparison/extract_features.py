@@ -19,13 +19,10 @@ from __future__ import annotations
 
 import argparse
 import io
-import math
-import os
 from pathlib import Path
 
 import torch
 from PIL import Image
-from torchvision.transforms.functional import to_tensor
 from tqdm import tqdm
 
 try:
@@ -35,8 +32,10 @@ try:
         discover_datasets,
         feature_cache_path,
         feature_variant,
+        prepare_stave_band,
         resolve_dataset_folder,
     )
+    from musvit_zeus_comparison.models import load_musvit, stave_canvas, stave_patch_grid
 except ImportError:
     from dataset import (
         ZeusDataset,
@@ -44,32 +43,10 @@ except ImportError:
         discover_datasets,
         feature_cache_path,
         feature_variant,
+        prepare_stave_band,
         resolve_dataset_folder,
     )
-
-try:
-    from transformers import ViTModel
-except ImportError:
-    ViTModel = None
-
-
-def prepare_stave_band(image: Image.Image, canvas_size: int = 1024, stave_height: int = 64) -> torch.Tensor:
-    """
-    The stave resized to the full canvas width and `stave_height`, as in the MuSViT documentation.
-    Returns a (3, stave_height, canvas_size) tensor in [0, 1], without normalization (as documented).
-    """
-    return to_tensor(image.convert("RGB").resize((canvas_size, stave_height)))
-
-
-def stave_canvas(bands: torch.Tensor, canvas_size: int = 1024) -> torch.Tensor:
-    """
-    MuSViT's documented stave input: the stave bands (B, 3, stave_height, canvas_size) pasted at the top
-    of a white square canvas of the size MuSViT was pre-trained on -> (B, 3, canvas_size, canvas_size).
-    Built on the bands' device, so that only the bands travel from the CPU.
-    """
-    canvas = bands.new_ones(bands.shape[0], 3, canvas_size, canvas_size)  # white, as to_tensor maps 255 to 1.0
-    canvas[:, :, :bands.shape[2]] = bands
-    return canvas
+    from models import load_musvit, stave_canvas, stave_patch_grid
 
 
 class StaveBands(torch.utils.data.Dataset):
@@ -92,49 +69,6 @@ class StaveBands(torch.utils.data.Dataset):
 
 def keep_as_list(batch: list) -> list:
     return batch
-
-
-def load_musvit(model_name: str = "PRAIG/musvit", device: str = "cuda", token: str | None = None):
-    """
-    Loads the MuSViT encoder as a plain ViTModel, as its model card prescribes:
-    AutoModel would give ViT-MAE, which randomly masks 70% of the patches.
-    """
-    if ViTModel is None:
-        raise ImportError("Please install transformers: pip install transformers")
-
-    print(f"Loading pre-trained MuSViT model '{model_name}' on {device}...")
-    hf_token = token or os.environ.get("HF_TOKEN")
-    model, loading_info = ViTModel.from_pretrained(model_name, token=hf_token, output_loading_info=True)
-
-    # The MAE checkpoint has no pooler, which is unused here; anything else missing would be randomly initialized
-    missing = [k for k in loading_info["missing_keys"] if not k.startswith("pooler.")]
-    if missing or loading_info["mismatched_keys"]:
-        raise RuntimeError(
-            f"'{model_name}' did not load cleanly into ViTModel. "
-            f"Missing weights: {missing}. Mismatched weights: {loading_info['mismatched_keys']}."
-        )
-
-    model.to(device)
-    model.eval()
-    return model
-
-
-def stave_patch_grid(last_hidden_state: torch.Tensor, patch_rows: int) -> torch.Tensor:
-    """
-    Cuts the stave's features out of the ViT output.
-
-    Args:
-        last_hidden_state: (B, 1 + N, D) with the [CLS] token first and N patches in a square grid
-        patch_rows: number of top patch rows covered by the stave
-    Returns:
-        (B, patch_rows, columns, D) patch features of the stave, without the white padding rows below it
-    """
-    patches = last_hidden_state[:, 1:, :]  # drop [CLS]
-    B, N, D = patches.shape
-    grid_dim = math.isqrt(N)
-    if grid_dim * grid_dim != N:
-        raise ValueError(f"Expected a square grid of patch tokens, got {N} tokens.")
-    return patches.reshape(B, grid_dim, grid_dim, D)[:, :patch_rows]
 
 
 def resolve_pickle_files(specs: list[str], dataset_dir: str | Path) -> list[Path]:
@@ -199,6 +133,7 @@ def extract_and_cache(
         return
 
     model = load_musvit(model_name=model_name, device=device, token=token)
+    print(f"MuSViT loaded on {device}.")
     canvas_size, patch_size = model.config.image_size, model.config.patch_size
     if stave_height % patch_size != 0 or not 0 < stave_height <= canvas_size:
         raise ValueError(
@@ -241,7 +176,7 @@ def extract_and_cache(
         with torch.inference_mode():
             canvas = stave_canvas(torch.stack(bands).to(device, non_blocking=True), canvas_size)
             last_hidden_state = model(canvas).last_hidden_state
-            grids = stave_patch_grid(last_hidden_state, patch_rows).to(dtype=dtype, device="cpu")
+            grids = stave_patch_grid(last_hidden_state, patch_rows, canvas_size // patch_size).to(dtype=dtype, device="cpu")
 
         for feat_path, feat in zip(paths, grids, strict=True):
             feat_path.parent.mkdir(parents=True, exist_ok=True)
