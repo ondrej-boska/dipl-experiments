@@ -125,6 +125,21 @@ def in_backbone_warmup(epoch: int, args: argparse.Namespace) -> bool:
     return finetunes_backbone(epoch, args) and epoch - args.finetune_from < args.finetune_warmup_epochs
 
 
+def stave_width_arg(value: str) -> int | None:
+    """--stave-width: a width in pixels, or 'aspect' (None) to keep each stave's aspect ratio."""
+    if value.lower() == "aspect":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a width in pixels or 'aspect', got '{value}'") from None
+
+
+def max_stave_width(args: argparse.Namespace) -> int:
+    """Widest stave band of musvit_e2e, over which the position embeddings are stretched with 'interpolate'."""
+    return args.stave_width or args.max_stave_width
+
+
 def load_initial_weights(model: CombinedOMRModel, state_dict: dict):
     """
     Loads the weights of another training run (--init-from). A Run 2 checkpoint (cached features) has no
@@ -339,6 +354,7 @@ def train_single_model(
         hf_token=args.hf_token,
         musvit_bf16=args.musvit_bf16,
         gradient_checkpointing=args.grad_checkpointing,
+        max_stave_width=max_stave_width(args),
     ).to(device)
     backbone = model.backbone
 
@@ -719,7 +735,8 @@ def main():
     # Run 3 (musvit_e2e): MuSViT backbone inside the model
     parser.add_argument("--musvit-model", type=str, default="PRAIG/musvit", help="Hugging Face ID of the ViT backbone of musvit_e2e, e.g. 'PRAIG/musvit' or 'PRAIG/musvit-light' (loaded as a plain ViTModel).")
     parser.add_argument("--musvit-input", type=str, default="canvas", choices=["canvas", "interpolate"], help="How musvit_e2e feeds stave bands to the backbone: pasted on the white 1024x1024 canvas, exactly as extract_features.py ('canvas'), or alone with interpolated position embeddings, which the MuSViT model card recommends for fine-tuning and which processes 16x fewer patches at height 64 ('interpolate').")
-    parser.add_argument("--stave-width", type=int, default=1024, help="Width musvit_e2e resizes staves to; must be the canvas size (1024) with --musvit-input canvas.")
+    parser.add_argument("--stave-width", type=stave_width_arg, default=1024, help="Width musvit_e2e resizes staves to, a multiple of 16; must be the canvas size (1024) with --musvit-input canvas. 'aspect' keeps each stave's aspect ratio (with --musvit-input interpolate): the width follows the stave height, rounded to a multiple of 16 and capped at --max-stave-width; batches are padded with white and the padding is masked.")
+    parser.add_argument("--max-stave-width", type=int, default=2048, help="Cap of the width of musvit_e2e staves with --stave-width aspect; longer staves are squashed. With --musvit-input interpolate, the pre-trained position embeddings are stretched over this width (with a fixed --stave-width, over that width).")
     parser.add_argument("--finetune-from", type=int, default=None, metavar="EPOCH", help="Fine-tune the musvit_e2e backbone from this (1-based) epoch on, frozen before; 1 fine-tunes from the start. Applies to resumed runs as well, e.g. resuming a frozen run at epoch 100 with --finetune-from 101. Default: frozen throughout.")
     parser.add_argument("--finetune-lr", type=float, default=1e-5, help="Learning rate of the backbone while fine-tuning, at the schedule's peak; it follows the --lr-decay schedule of --learning-rate, scaled.")
     parser.add_argument("--finetune-warmup-epochs", type=float, default=5, help="The backbone learning rate rises linearly from 0 over this many epochs (fractions allowed) after unfreezing, updated at every step; 0 disables the warmup.")
@@ -761,6 +778,12 @@ def main():
         parser.error("--finetune-from must be an epoch >= 1.")
     if args.finetune_warmup_epochs < 0:
         parser.error("--finetune-warmup-epochs must be >= 0.")
+    if args.stave_width is None and args.model == "musvit_e2e" and args.musvit_input != "interpolate":
+        parser.error("--stave-width aspect needs --musvit-input interpolate; the 'canvas' input is always 1024 px wide.")
+    for name in ("stave_width", "max_stave_width"):
+        width = getattr(args, name)
+        if width is not None and (width <= 0 or width % 16 != 0):
+            parser.error(f"--{name.replace('_', '-')} must be a positive multiple of 16 (the patch size), got {width}.")
     if args.augment and args.model in ("musvit", "compare"):
         parser.error("--augment cannot augment the pre-extracted features of 'musvit'; use 'zeus' or 'musvit_e2e'.")
     try:
@@ -876,6 +899,7 @@ def main():
             max_image_width=args.max_image_width,
             stave_height=args.feature_stave_height,
             stave_width=args.stave_width,
+            max_stave_width=args.max_stave_width,
         )
         train_ds = StaveOMRDataset(train_samples, **dataset_kwargs, augment=args.augment)
         val_ds = StaveOMRDataset(val_samples, **dataset_kwargs)
@@ -899,7 +923,10 @@ def main():
         res["augment"] = args.augment
         if m == "musvit_e2e":
             tuning = f"fine-tuned from epoch {args.finetune_from}" if args.finetune_from is not None else "frozen"
-            res["encoder"] = f"{args.musvit_model} ({args.musvit_input}, {tuning}) + Adapter"
+            width = args.stave_width or f"aspect <= {args.max_stave_width}"
+            res["encoder"] = (
+                f"{args.musvit_model} ({args.musvit_input}, {args.feature_stave_height} x {width}, {tuning}) + Adapter"
+            )
 
         # 3. Export after every run, so that a finished run is never lost to a failure of the next one
         export_results_table([res], args.output_dir)

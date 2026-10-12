@@ -44,6 +44,19 @@ def prepare_stave_band(image: Image.Image, width: int = 1024, height: int = 64) 
     return to_tensor(image.convert("RGB").resize((width, height)))
 
 
+MUSVIT_PATCH_SIZE = 16
+
+
+def aspect_stave_width(image_size: tuple[int, int], height: int, max_width: int, patch_size: int = MUSVIT_PATCH_SIZE) -> int:
+    """
+    Width of a stave of `image_size` (width, height) resized to `height` with its aspect ratio kept, rounded to
+    a multiple of the patch size and capped at `max_width` (longer staves are squashed).
+    """
+    w, h = image_size
+    columns = max(1, round(height * w / h / patch_size))
+    return min(columns * patch_size, max_width)
+
+
 # ==============================================================================
 # Token Vocabulary
 # ==============================================================================
@@ -245,7 +258,8 @@ class StaveOMRDataset(Dataset):
         - 'columns': one timestep per patch column, its rows concatenated -> (columns, rows * dim)
         - 'raster': row-major patch sequence, as in the MuSViT documentation -> (rows * columns, dim)
     - Run 3 ('musvit_e2e'): decodes sample.image bytes into a (3, stave_height, stave_width) RGB stave band
-      in [0, 1], for the MuSViT backbone inside the model.
+      in [0, 1], for the MuSViT backbone inside the model. With stave_width=None, the band keeps the stave's
+      aspect ratio, its width rounded to a multiple of the patch size and capped at max_stave_width.
     - Targets: tokenized from sample.lmx string.
 
     With `augment` (a Zeus augmentation pipeline, see augmentation.py), images and stave bands are augmented
@@ -265,7 +279,8 @@ class StaveOMRDataset(Dataset):
         image_height: int = 96,  # Zeus single-staff standard height
         max_image_width: int = 1536,
         stave_height: int = 64,  # MuSViT stave band height ('musvit_e2e')
-        stave_width: int = 1024,  # MuSViT stave band width ('musvit_e2e')
+        stave_width: int | None = 1024,  # MuSViT stave band width ('musvit_e2e'); None keeps the aspect ratio
+        max_stave_width: int = 2048,  # Cap of the aspect-preserving stave band width ('musvit_e2e')
         augment: str = "",  # Zeus augmentation pipeline, e.g. 'h:8,rotate:1,v:4'
     ):
         self.items = [(name, sample) for name, dataset_samples in samples.items() for sample in dataset_samples]
@@ -278,6 +293,7 @@ class StaveOMRDataset(Dataset):
         self.max_image_width = max_image_width
         self.stave_height = stave_height
         self.stave_width = stave_width
+        self.max_stave_width = max_stave_width
 
         if self.mode not in ("zeus", "musvit", "musvit_e2e"):
             raise ValueError(f"Unknown mode '{mode}'. Must be 'zeus', 'musvit' or 'musvit_e2e'.")
@@ -287,7 +303,7 @@ class StaveOMRDataset(Dataset):
             raise ValueError(f"Unknown feature_layout '{feature_layout}'. Must be 'columns' or 'raster'.")
         if augment and self.mode == "musvit":
             raise ValueError("Pre-extracted MuSViT features cannot be augmented; use mode 'musvit_e2e'.")
-        # Stave bands have a fixed width, which the horizontal shift must keep
+        # The horizontal shift keeps the width of stave bands: fixed, or a multiple of the patch size up to the cap
         self.augmentation = ZeusAugmentation(augment, keep_width=self.mode == "musvit_e2e") if augment else None
 
         # Reading every feature file once up front, instead of in every epoch, spares slow (e.g. network) filesystems
@@ -366,7 +382,9 @@ class StaveOMRDataset(Dataset):
     def _load_stave_band(self, image_bytes: bytes, sample_name: str) -> torch.Tensor:
         """Stave band for the MuSViT backbone (Run 3), prepared exactly as extract_features.py does."""
         try:
-            return prepare_stave_band(Image.open(io.BytesIO(image_bytes)), self.stave_width, self.stave_height)
+            image = Image.open(io.BytesIO(image_bytes))
+            width = self.stave_width or aspect_stave_width(image.size, self.stave_height, self.max_stave_width)
+            return prepare_stave_band(image, width, self.stave_height)
         except OSError as e:
             raise ValueError(f"Could not decode the image of sample '{sample_name}': {e}") from e
 

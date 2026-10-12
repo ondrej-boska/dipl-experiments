@@ -240,7 +240,8 @@ python -m musvit_zeus_comparison.train \
 | :--- | :--- |
 | `--musvit-model ID` | Hugging Face ID of the backbone: `PRAIG/musvit` (default), `PRAIG/musvit-light`, or another ViT, loaded as a plain `ViTModel`. |
 | `--musvit-input canvas\|interpolate` | `canvas` (default) pastes the stave band on the white 1024x1024 canvas exactly as `extract_features.py` does, so a frozen backbone computes the Run 2 features. `interpolate` feeds the band alone with interpolated position embeddings, which the MuSViT model card recommends for fine-tuning. At height 64 that is 256 patches instead of 4096, so it is far cheaper. |
-| `--stave-height`, `--stave-width` | Size the staves are resized to (default 64 x 1024). The width must be 1024 with `canvas`. |
+| `--stave-height`, `--stave-width` | Size the staves are resized to (default 64 x 1024), multiples of 16. The width must be 1024 with `canvas`. With `interpolate`, `--stave-width aspect` keeps each stave's aspect ratio (see below). |
+| `--max-stave-width` | Cap of the `aspect` widths (default 2048); longer staves are squashed. |
 | `--feature-layout` | Same as in Run 2. |
 | `--finetune-from EPOCH` | The backbone trains from this epoch on and stays frozen before it; `1` fine-tunes from the start. Default: frozen throughout. |
 | `--finetune-lr LR` | Peak learning rate of the backbone (default `1e-5`). It follows the `--lr-decay` schedule, scaled, and is 0 while frozen. |
@@ -250,6 +251,11 @@ python -m musvit_zeus_comparison.train \
 | `--init-from CKPT` | Starts a new run (epoch 1, fresh optimizer) from a checkpoint's weights. A `musvit` (Run 2) checkpoint with matching feature settings initializes the adapter and decoder; the backbone keeps its pre-trained weights. |
 | `--hf-token` | Token for the gated MuSViT models (default: `HF_TOKEN`). |
 
+A fixed width stretches short staves and squashes long ones, so the horizontal scale differs from stave to stave. `--stave-width aspect` (with `interpolate`) instead resizes each stave to `--stave-height` with its aspect ratio kept, rounds the width to a multiple of 16 and caps it at `--max-stave-width`, like the Zeus baseline does at height 96. A batch is padded with white to its widest stave, and the padding is masked:
+- **Position embeddings:** Hugging Face would stretch the pre-trained 64 x 64 position grid over the padded batch width, so a stave's embeddings would depend on its batch. Instead, the grid is stretched over `--max-stave-width` pixels and cut at the input's width, so a patch column always gets the same embedding. Vertically, the grid is still stretched over the stave height. With a fixed `--stave-width`, the grid is stretched over that width, which is exactly Hugging Face's interpolation.
+- **Attention:** the padding patches are masked out of the backbone's attention (this needs a transformers version whose `ViTModel` takes an `attention_mask`, e.g. 5.x), and out of the adapter BiLSTM and the decoder's attention. A stave's features are therefore the same in any batch.
+- **Size:** at height 96, MuSViT's 1024 x 1024 pre-training pages put staves at roughly 85-100 px high, so 96 is about the scale MuSViT has seen (64 is noticeably smaller). A 96 x 2048 stave has 768 patches, against 256 for 64 x 1024; add `--grad-checkpointing` if fine-tuning runs out of GPU memory.
+
 Ways to start fine-tuning:
 - **From scratch, fine-tuning from epoch N:** `--finetune-from N`.
 - **Resuming a run with fine-tuning on:** e.g. a frozen run stopped at epoch 100, continued with `--resume auto --finetune-from 101`. This gives the same result as an uninterrupted run with `--finetune-from 101`. A warning is printed if a run that was already fine-tuned is resumed without `--finetune-from`.
@@ -257,7 +263,7 @@ Ways to start fine-tuning:
 
 The backbone has its own optimizer parameter group from the start, so frozen and fine-tuned checkpoints share one layout. The checkpoints include the backbone, which makes them much larger (~350 MB for MuSViT, about 3x that with the Adam state once fine-tuned). Without `--model compare`, results go to `musvit_e2e_results.json` and are merged into the results table. Use a separate `--output-dir` for each backbone or setting, since they share the `musvit_e2e_*` file names.
 
-`run_musvit_e2e.slurm` in the repository root trains Run 3 from scratch for 1000 epochs. It uses `interpolate` input, Zeus augmentation and bf16, and fine-tunes from epoch 101. Each job resumes from the latest checkpoint, so the run is submitted as a chain of jobs (see the script's header).
+`run_musvit_e2e.slurm` in the repository root trains Run 3 from scratch for 1000 epochs. It uses `interpolate` input with aspect-preserving 96 px high staves, Zeus augmentation and bf16, and fine-tunes from epoch 101. Each job resumes from the latest checkpoint, so the run is submitted as a chain of jobs (see the script's header).
 
 ### Image Augmentation
 `--augment` augments the training images of `zeus` and `musvit_e2e` the way the TensorFlow Zeus does, with the same syntax:
@@ -267,8 +273,8 @@ The backbone has its own optimizer parameter group from the start, so frozen and
 ```
 
 It is a comma-separated pipeline of filters, each applied with a 50:50 chance: horizontal shift, rotation, vertical shift, dilatation/erosion, boundary noise, global noise, contrast and brightness (see `augmentation.py` and Zeus's `docs/augmentations.md`). The default is no augmentation, so existing runs stay unchanged.
-- As in Zeus, augmentation is the last step before the model, so the pixel amounts refer to the model's input: the 96 px high Zeus image, or the 64 x 1024 stave band of `musvit_e2e`.
-- On the fixed-width stave bands, the horizontal shift moves the content by the same amount, but pads or crops the right side so that the width stays. Zeus instead lets the width change.
+- As in Zeus, augmentation is the last step before the model, so the pixel amounts refer to the model's input: the 96 px high Zeus image, or the stave band of `musvit_e2e` (e.g. 64 x 1024).
+- On the stave bands, the horizontal shift moves the content by the same amount, but pads or crops the right side so that the width stays (a multiple of the patch size). Zeus instead lets the width change.
 - Each training sample gets its own seed from the batch sampler, whose state is saved in checkpoints. So augmented training resumes exactly as well, for any `--num-workers`.
 - Pre-extracted features (`musvit`) cannot be augmented.
 

@@ -4,6 +4,8 @@ and end-to-end MuSViT + Zeus with an optionally fine-tuned backbone (Run 3).
 Shared Bahdanau Attention LSTM Decoder ensures 100% identical decoding mechanics.
 """
 
+import inspect
+import math
 import os
 from typing import Literal
 
@@ -439,6 +441,32 @@ def stave_patch_grid(last_hidden_state: torch.Tensor, patch_rows: int, patch_col
     return patches.reshape(B, N // patch_columns, patch_columns, D)[:, :patch_rows]
 
 
+def anchor_position_embeddings(embeddings: nn.Module, reference_width: int):
+    """
+    Replaces the position-embedding interpolation of a Hugging Face ViTEmbeddings module. Hugging Face stretches the
+    pre-trained grid over the whole (padded) input, so a patch column's embedding would depend on the widest stave of
+    its batch. Here the grid is stretched over `reference_width` pixels and cut at the input's width instead: a patch
+    column always gets the same embedding, and every input is on the same horizontal scale. Vertically, the grid is
+    stretched over the input's height, as before. For inputs `reference_width` wide, this is Hugging Face's result.
+    """
+    patch_size = embeddings.patch_size
+    reference_columns = reference_width // patch_size
+
+    def interpolate_pos_encoding(tokens: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        rows, columns = height // patch_size, width // patch_size
+        if columns > reference_columns:
+            raise ValueError(f"Input {width} px wide exceeds the position-embedding reference width of {reference_width} px.")
+        position_embeddings = embeddings.position_embeddings  # (1, 1 + side^2, D), [CLS] first
+        cls_position, patch_positions = position_embeddings[:, :1], position_embeddings[:, 1:]
+        side = math.isqrt(patch_positions.shape[1])
+        grid = patch_positions.reshape(1, side, side, -1).permute(0, 3, 1, 2)
+        grid = F.interpolate(grid, size=(rows, reference_columns), mode="bicubic", align_corners=False)[..., :columns]
+        return torch.cat((cls_position, grid.permute(0, 2, 3, 1).reshape(1, rows * columns, -1)), dim=1)
+
+    # An instance attribute shadows the method, which ViTEmbeddings.forward calls with the input's height and width
+    embeddings.interpolate_pos_encoding = interpolate_pos_encoding
+
+
 def arrange_patch_grid(grid: torch.Tensor, layout: str) -> torch.Tensor:
     """
     Arranges a (..., rows, columns, D) MuSViT patch grid as a sequence:
@@ -462,6 +490,9 @@ class MusvitBackbone(nn.Module):
       extract_features.py does; the ViT processes all canvas_size^2 / patch_size^2 patches (4096 for MuSViT).
     - 'interpolate': the band alone is processed with interpolated position embeddings, which the MuSViT model
       card recommends for fine-tuning; 16x fewer patches at height 64, so far cheaper to fine-tune.
+      The bands may have any width up to `max_width`; the pre-trained position grid is stretched over `max_width`
+      pixels and cut at the band's width (see anchor_position_embeddings), and the patches of the white padding to
+      the widest band of a batch are masked out of the attention, so a band's features do not depend on its batch.
 
     While frozen, it runs without gradients and stays in eval mode even when the model is trained.
     """
@@ -473,6 +504,7 @@ class MusvitBackbone(nn.Module):
         token: str | None = None,
         bf16: bool = False,
         gradient_checkpointing: bool = False,
+        max_width: int = 1024,
     ):
         super().__init__()
         if input_mode not in ("canvas", "interpolate"):
@@ -493,6 +525,12 @@ class MusvitBackbone(nn.Module):
         self.stave_height = stave_height
         self.patch_rows = stave_height // self.patch_size
 
+        if input_mode == "interpolate":
+            if max_width % self.patch_size != 0 or max_width < self.patch_size:
+                raise ValueError(f"The maximum stave width must be a positive multiple of the patch size ({self.patch_size}), got {max_width}.")
+            anchor_position_embeddings(self.vit.embeddings, max_width)
+        self.max_width = max_width if input_mode == "interpolate" else self.canvas_size
+
         if gradient_checkpointing:
             # Takes effect only while the ViT is in training mode, i.e. while fine-tuning
             self.vit.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -512,19 +550,40 @@ class MusvitBackbone(nn.Module):
             self.vit.eval()
         return self
 
-    def forward(self, bands: torch.Tensor) -> torch.Tensor:
+    def padding_mask(self, widths: torch.Tensor, height: int, width: int) -> torch.Tensor | None:
+        """
+        (B, 1 + rows * columns) attention mask of the ViT tokens ([CLS] first, patches in row-major order), False at
+        the patches of bands padded beyond their `widths`; None without padding.
+        """
+        columns = widths.to(self.vit.device, non_blocking=True) // self.patch_size
+        total_columns = width // self.patch_size
+        if (columns >= total_columns).all():
+            return None
+        if "attention_mask" not in inspect.signature(self.vit.forward).parameters:
+            raise RuntimeError(
+                "Masking the padding of variable-width staves needs a ViTModel that takes an attention_mask "
+                "(transformers 5); upgrade transformers, or use a fixed --stave-width."
+            )
+        valid = torch.arange(total_columns, device=columns.device)[None, :] < columns[:, None]  # (B, columns)
+        patches = valid[:, None, :].expand(-1, height // self.patch_size, -1).flatten(1)
+        return torch.cat((patches.new_ones(patches.shape[0], 1), patches), dim=1)
+
+    def forward(self, bands: torch.Tensor, widths: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             bands: (B, 3, stave_height, width) stave bands in [0, 1], without normalization (as documented);
-                the width must be the canvas size in 'canvas' mode and a multiple of the patch size otherwise
+                the width must be the canvas size in 'canvas' mode and a multiple of the patch size up to
+                `max_width` otherwise
+            widths: optional (B,) unpadded band widths in pixels ('interpolate' mode); the patches beyond them
+                are masked out of the attention
         Returns:
             (B, patch_rows, width / patch_size, hidden_size) patch grid of the staves, in FP32
         """
         height, width = bands.shape[-2:]
-        if height != self.stave_height or width % self.patch_size != 0:
+        if height != self.stave_height or width % self.patch_size != 0 or width > self.max_width:
             raise ValueError(
-                f"Expected stave bands of height {self.stave_height} and a width divisible by {self.patch_size}, "
-                f"got {height}x{width}."
+                f"Expected stave bands of height {self.stave_height} and a width divisible by {self.patch_size} "
+                f"of at most {self.max_width}, got {height}x{width}."
             )
         if self.input_mode == "canvas" and width != self.canvas_size:
             raise ValueError(f"The 'canvas' input mode needs stave bands {self.canvas_size} px wide, got {width}.")
@@ -536,7 +595,9 @@ class MusvitBackbone(nn.Module):
             if self.input_mode == "canvas":
                 hidden = self.vit(stave_canvas(bands, self.canvas_size)).last_hidden_state
             else:
-                hidden = self.vit(bands, interpolate_pos_encoding=True).last_hidden_state
+                mask = self.padding_mask(widths, height, width) if widths is not None else None
+                kwargs = {"attention_mask": mask} if mask is not None else {}
+                hidden = self.vit(bands, interpolate_pos_encoding=True, **kwargs).last_hidden_state
         return stave_patch_grid(hidden.float(), self.patch_rows, width // self.patch_size)
 
 
@@ -565,11 +626,19 @@ class MusvitE2EEncoder(MusvitEncoder):
     def forward(self, bands: torch.Tensor, lengths: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
-            bands: (B, 3, stave_height, width) stave bands in [0, 1]
-            lengths: ignored; all bands of a batch have the same width, so no timestep is padding
+            bands: (B, 3, stave_height, width) stave bands in [0, 1], padded with white to the widest of the batch
+            lengths: optional (B,) unpadded band widths in pixels (multiples of the patch size), preferably on the CPU;
+                the patches of the padding are then masked out
         """
-        features = arrange_patch_grid(self.backbone(bands), self.feature_layout)
-        return super().forward(features)
+        grid = self.backbone(bands, lengths)  # (B, rows, columns, D)
+        if lengths is None:
+            return super().forward(arrange_patch_grid(grid, self.feature_layout))
+        columns = lengths.cpu() // self.backbone.patch_size
+        if self.feature_layout == "columns":
+            return super().forward(arrange_patch_grid(grid, "columns"), columns)
+        # In row-major order, every row ends with padding, so the valid patches of each stave are gathered first
+        sequences = [arrange_patch_grid(g[:, :c], "raster") for g, c in zip(grid, columns.tolist(), strict=True)]
+        return super().forward(nn.utils.rnn.pad_sequence(sequences, batch_first=True), columns * self.backbone.patch_rows)
 
 
 # ==============================================================================
@@ -603,6 +672,7 @@ class CombinedOMRModel(nn.Module):
         hf_token: str | None = None,
         musvit_bf16: bool = False,
         gradient_checkpointing: bool = False,
+        max_stave_width: int = 1024,
     ):
         super().__init__()
         self.encoder_type = encoder_type.lower()
@@ -619,6 +689,7 @@ class CombinedOMRModel(nn.Module):
                 token=hf_token,
                 bf16=musvit_bf16,
                 gradient_checkpointing=gradient_checkpointing,
+                max_width=max_stave_width,
             )
             self.encoder = MusvitE2EEncoder(backbone, dim=dim, feature_layout=feature_layout, dropout=dropout)
         else:
