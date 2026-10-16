@@ -220,7 +220,7 @@ With `--model compare`, the results are exported after each run, so a finished Z
 - `columns` (default): one timestep per patch column, with the rows of that column concatenated, i.e. `(64, rows x 768)`. This keeps the vertical position (pitch) of every patch, like the Zeus encoder flattening height x channels per column.
 - `raster`: the row-major patch sequence of the MuSViT documentation (`flatten(1, 2)`), i.e. `(rows x 64, 768)`.
 
-#### Run 3: End-to-End MuSViT + Zeus (frozen or fine-tuned backbone)
+#### Run 3: End-to-End MuSViT + Zeus (frozen, fully fine-tuned or LoRA-tuned backbone)
 `--model musvit_e2e` puts the MuSViT backbone inside the model, with the Run 2 adapter and the Zeus decoder on top. It reads the stave images instead of cached features, so no extraction is needed, and the backbone can be fine-tuned. Image augmentation can later go in the dataset as well.
 
 ```bash
@@ -244,7 +244,9 @@ python -m musvit_zeus_comparison.train \
 | `--max-stave-width` | Cap of the `aspect` widths (default 2048); longer staves are squashed. |
 | `--feature-layout` | Same as in Run 2. |
 | `--finetune-from EPOCH` | The backbone trains from this epoch on and stays frozen before it; `1` fine-tunes from the start. Default: frozen throughout. |
-| `--finetune-lr LR` | Peak learning rate of the backbone (default `1e-5`). It follows the `--lr-decay` schedule, scaled, and is 0 while frozen. |
+| `--finetune-method full\|lora` | `full` (default) trains all backbone weights. `lora` trains LoRA adapters on the attention query/key/value projections and keeps the pre-trained weights frozen, as the [MuSViT repository](https://github.com/OMR-PRAIG-UA-ES/MuSViT/tree/main/experiments/staff_level_omr) fine-tunes for staff-level OMR. Needs `peft`. |
+| `--finetune-lr LR` | Peak learning rate of the backbone (default `1e-5` with `full`, `3e-4` with `lora`, the MuSViT repository's). It follows the `--lr-decay` schedule, scaled, and is 0 while frozen. |
+| `--lora-rank R`, `--lora-alpha A`, `--lora-dropout P` | LoRA settings (defaults `8`, `16`, `0.1`, the MuSViT repository's). The adapters are rank-stabilized, i.e. scaled by `A / sqrt(R)`. |
 | `--finetune-warmup-epochs N` | After unfreezing, the backbone learning rate rises linearly from 0 over N epochs (default 5; fractions allowed; `0` disables). It is updated at every step. |
 | `--musvit-bf16` | Runs the backbone in bfloat16 autocast: much faster and lighter on Ampere+ GPUs. |
 | `--grad-checkpointing` | Recomputes backbone activations in the backward pass, saving GPU memory while fine-tuning. |
@@ -260,6 +262,8 @@ Ways to start fine-tuning:
 - **From scratch, fine-tuning from epoch N:** `--finetune-from N`.
 - **Resuming a run with fine-tuning on:** e.g. a frozen run stopped at epoch 100, continued with `--resume auto --finetune-from 101`. This gives the same result as an uninterrupted run with `--finetune-from 101`. A warning is printed if a run that was already fine-tuned is resumed without `--finetune-from`.
 - **From a trained Run 2 model:** `--init-from experiment_results/musvit_best.pt --finetune-from 1`, usually with a lower `--learning-rate` for the adapter and decoder.
+
+With `--finetune-method lora`, the adapters are in the model from the start but add nothing until `--finetune-from` (they start at zero), so the frozen phase, the warmup and resuming work as with full fine-tuning. A run must be resumed with the method it started with. To LoRA-tune a model trained without LoRA, start a new run with `--init-from CKPT --finetune-method lora --finetune-from 1`: the checkpoint's backbone becomes the frozen base weights.
 
 The backbone has its own optimizer parameter group from the start, so frozen and fine-tuned checkpoints share one layout. The checkpoints include the backbone, which makes them much larger (~350 MB for MuSViT, about 3x that with the Adam state once fine-tuned). Without `--model compare`, results go to `musvit_e2e_results.json` and are merged into the results table. Use a separate `--output-dir` for each backbone or setting, since they share the `musvit_e2e_*` file names.
 

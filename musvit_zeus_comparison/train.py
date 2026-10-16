@@ -7,7 +7,7 @@ Follows the Zeus repository workflow:
 - Run 1 (Zeus Baseline): CNN-BiLSTM Encoder + Zeus Bahdanau Attention Decoder (trained from scratch).
 - Run 2 (MuSViT + Zeus): Pre-trained MuSViT Vision Transformer Feature Extractor + Zeus Decoder.
 - Run 3 (end-to-end MuSViT + Zeus): the Run 2 model with the MuSViT backbone inside, reading stave images
-  instead of cached features; the backbone is frozen, or fine-tuned from a given epoch on.
+  instead of cached features; the backbone is frozen, or fine-tuned (fully or with LoRA) from a given epoch on.
 - Evaluation: Symbol Error Rate (SER) computed directly with zeus.evaluation.symbol_error_rate.
 - Exports results to Markdown and CSV summary tables, merging concurrent SLURM runs.
 """
@@ -19,6 +19,7 @@ import csv
 import json
 import math
 import random
+import re
 import time
 from pathlib import Path
 
@@ -140,11 +141,33 @@ def max_stave_width(args: argparse.Namespace) -> int:
     return args.stave_width or args.max_stave_width
 
 
+def has_lora(state_dict: dict) -> bool:
+    """Whether a model state dict holds LoRA adapters."""
+    return any("lora_" in k for k in state_dict)
+
+
+def check_finetune_method(model: CombinedOMRModel, state_dict: dict):
+    """Fails clearly when a checkpoint to resume or evaluate was trained with another --finetune-method."""
+    if model.backbone is None:
+        return
+    checkpoint_method = "lora" if has_lora(state_dict) else "full"
+    if checkpoint_method != model.backbone.finetune_method:
+        raise RuntimeError(
+            f"The checkpoint was trained with --finetune-method {checkpoint_method}, so it must be resumed or "
+            f"evaluated with it, not with '{model.backbone.finetune_method}'. To LoRA-tune a model trained without "
+            f"LoRA, start a new run from it with --init-from."
+        )
+
+
 def load_initial_weights(model: CombinedOMRModel, state_dict: dict):
     """
     Loads the weights of another training run (--init-from). A Run 2 checkpoint (cached features) has no
-    backbone, which then keeps its pre-trained weights; all other weights must match.
+    backbone, which then keeps its pre-trained weights; all other weights must match. A Run 3 checkpoint without
+    LoRA initializes a LoRA model too: its query/key/value weights are the base weights of the adapted projections,
+    and the adapters start untrained.
     """
+    if model.backbone is not None and model.backbone.finetune_method == "lora" and not has_lora(state_dict):
+        state_dict = {re.sub(r"\.(query|key|value|[qkv]_proj)\.(weight|bias)$", r".\1.base_layer.\2", k): v for k, v in state_dict.items()}
     result = model.load_state_dict(state_dict, strict=False)
     missing = [k for k in result.missing_keys if not k.startswith("encoder.backbone.")]
     if missing or result.unexpected_keys:
@@ -153,7 +176,8 @@ def load_initial_weights(model: CombinedOMRModel, state_dict: dict):
             f"Missing weights: {missing}. Unexpected weights: {result.unexpected_keys}."
         )
     if model.backbone is not None:
-        source = "pre-trained (not in the checkpoint)" if result.missing_keys else "from the checkpoint"
+        pretrained = [k for k in result.missing_keys if "lora_" not in k]
+        source = "pre-trained (not in the checkpoint)" if pretrained else "from the checkpoint"
         print(f"Initialized the model from the checkpoint; MuSViT backbone weights: {source}.")
 
 
@@ -355,6 +379,10 @@ def train_single_model(
         musvit_bf16=args.musvit_bf16,
         gradient_checkpointing=args.grad_checkpointing,
         max_stave_width=max_stave_width(args),
+        finetune_method=args.finetune_method,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
     ).to(device)
     backbone = model.backbone
 
@@ -362,6 +390,8 @@ def train_single_model(
     dec_params = sum(p.numel() for p in model.decoder.parameters())
     total_params = enc_params + dec_params
     backbone_str = f" (MuSViT backbone: {sum(p.numel() for p in backbone.parameters()):,})" if backbone is not None else ""
+    if backbone is not None and backbone.finetune_method == "lora":
+        backbone_str = f"{backbone_str[:-1]}, of which LoRA adapters: {sum(p.numel() for p in backbone.adapter_parameters()):,})"
     print(f"Parameters: Encoder: {enc_params:,}{backbone_str} | Decoder: {dec_params:,} | Total: {total_params:,}")
 
     output_dir = Path(args.output_dir)
@@ -396,6 +426,7 @@ def train_single_model(
     prior_train_time = 0.0
 
     if checkpoint is not None:
+        check_finetune_method(model, checkpoint["model"])
         model.load_state_dict(checkpoint["model"])
         start_epoch = checkpoint.get("epoch", 0) + 1
         if "optimizer" in checkpoint:
@@ -738,7 +769,11 @@ def main():
     parser.add_argument("--stave-width", type=stave_width_arg, default=1024, help="Width musvit_e2e resizes staves to, a multiple of 16; must be the canvas size (1024) with --musvit-input canvas. 'aspect' keeps each stave's aspect ratio (with --musvit-input interpolate): the width follows the stave height, rounded to a multiple of 16 and capped at --max-stave-width; batches are padded with white and the padding is masked.")
     parser.add_argument("--max-stave-width", type=int, default=2048, help="Cap of the width of musvit_e2e staves with --stave-width aspect; longer staves are squashed. With --musvit-input interpolate, the pre-trained position embeddings are stretched over this width (with a fixed --stave-width, over that width).")
     parser.add_argument("--finetune-from", type=int, default=None, metavar="EPOCH", help="Fine-tune the musvit_e2e backbone from this (1-based) epoch on, frozen before; 1 fine-tunes from the start. Applies to resumed runs as well, e.g. resuming a frozen run at epoch 100 with --finetune-from 101. Default: frozen throughout.")
-    parser.add_argument("--finetune-lr", type=float, default=1e-5, help="Learning rate of the backbone while fine-tuning, at the schedule's peak; it follows the --lr-decay schedule of --learning-rate, scaled.")
+    parser.add_argument("--finetune-method", type=str, default="full", choices=["full", "lora"], help="How --finetune-from fine-tunes the musvit_e2e backbone: all its weights ('full'), or LoRA adapters on the attention query/key/value projections with the pre-trained weights frozen ('lora'), as the MuSViT repository does for staff-level OMR. A run must be resumed with the same method.")
+    parser.add_argument("--finetune-lr", type=float, default=None, help="Learning rate of the backbone while fine-tuning, at the schedule's peak; it follows the --lr-decay schedule of --learning-rate, scaled. Default: 1e-5 with --finetune-method full, 3e-4 (the MuSViT repository's) with lora.")
+    parser.add_argument("--lora-rank", type=int, default=8, help="Rank of the LoRA adapters (--finetune-method lora; MuSViT repository: 8).")
+    parser.add_argument("--lora-alpha", type=float, default=16, help="LoRA alpha; the adapters are scaled by alpha / sqrt(rank) (rank-stabilized LoRA, as in the MuSViT repository: 16).")
+    parser.add_argument("--lora-dropout", type=float, default=0.1, help="Dropout on the input of the LoRA adapters (MuSViT repository: 0.1).")
     parser.add_argument("--finetune-warmup-epochs", type=float, default=5, help="The backbone learning rate rises linearly from 0 over this many epochs (fractions allowed) after unfreezing, updated at every step; 0 disables the warmup.")
     parser.add_argument("--musvit-bf16", action="store_true", help="Run the musvit_e2e backbone in bfloat16 autocast (Ampere+ GPUs): much faster and less memory, slightly less precise.")
     parser.add_argument("--grad-checkpointing", action="store_true", help="Recompute the backbone's activations in the backward pass instead of storing them, to fine-tune with less GPU memory at ~30%% more compute.")
@@ -778,6 +813,10 @@ def main():
         parser.error("--finetune-from must be an epoch >= 1.")
     if args.finetune_warmup_epochs < 0:
         parser.error("--finetune-warmup-epochs must be >= 0.")
+    if args.finetune_lr is None:
+        args.finetune_lr = 3e-4 if args.finetune_method == "lora" else 1e-5
+    if args.lora_rank < 1:
+        parser.error("--lora-rank must be >= 1.")
     if args.stave_width is None and args.model == "musvit_e2e" and args.musvit_input != "interpolate":
         parser.error("--stave-width aspect needs --musvit-input interpolate; the 'canvas' input is always 1024 px wide.")
     for name in ("stave_width", "max_stave_width"):
@@ -922,7 +961,8 @@ def main():
         res["datasets"] = selection
         res["augment"] = args.augment
         if m == "musvit_e2e":
-            tuning = f"fine-tuned from epoch {args.finetune_from}" if args.finetune_from is not None else "frozen"
+            method = "LoRA " if args.finetune_method == "lora" else ""
+            tuning = f"{method}fine-tuned from epoch {args.finetune_from}" if args.finetune_from is not None else "frozen"
             width = args.stave_width or f"aspect <= {args.max_stave_width}"
             res["encoder"] = (
                 f"{args.musvit_model} ({args.musvit_input}, {args.feature_stave_height} x {width}, {tuning}) + Adapter"

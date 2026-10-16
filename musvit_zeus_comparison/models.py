@@ -18,6 +18,11 @@ try:
 except ImportError:
     ViTModel = None
 
+try:
+    from peft import LoraConfig, inject_adapter_in_model
+except ImportError:
+    LoraConfig = None
+
 
 def lengths_to_mask(lengths: torch.Tensor, max_len: int, device: torch.device) -> torch.Tensor:
     """(B,) lengths -> (B, max_len) bool mask on `device`, True at valid timesteps."""
@@ -481,6 +486,15 @@ def arrange_patch_grid(grid: torch.Tensor, layout: str) -> torch.Tensor:
     raise ValueError(f"Unknown feature layout '{layout}'. Must be 'columns' or 'raster'.")
 
 
+def attention_projection_names(vit: nn.Module) -> list[str]:
+    """Names of the attention query/key/value projections of a Hugging Face ViT, which differ between versions."""
+    names = {name.rsplit(".", 1)[-1] for name, module in vit.named_modules() if isinstance(module, nn.Linear)}
+    for candidates in (["query", "key", "value"], ["q_proj", "k_proj", "v_proj"]):
+        if names.issuperset(candidates):
+            return candidates
+    raise RuntimeError(f"Found no attention query/key/value projections in the ViT, only the layers {sorted(names)}.")
+
+
 class MusvitBackbone(nn.Module):
     """
     Pre-trained MuSViT (or another ViT on the Hugging Face Hub) applied to stave bands, trainable or frozen.
@@ -494,6 +508,13 @@ class MusvitBackbone(nn.Module):
       pixels and cut at the band's width (see anchor_position_embeddings), and the patches of the white padding to
       the widest band of a batch are masked out of the attention, so a band's features do not depend on its batch.
 
+    Fine-tuning methods:
+    - 'full': all ViT weights are trained.
+    - 'lora': LoRA adapters on the attention query/key/value projections are trained and the pre-trained weights
+      stay frozen, as the MuSViT repository fine-tunes for staff-level OMR. The adapters are in the model from the
+      start and add nothing until trained (their B matrices start at zero), so frozen and fine-tuned checkpoints
+      share one layout.
+
     While frozen, it runs without gradients and stays in eval mode even when the model is trained.
     """
     def __init__(
@@ -505,13 +526,20 @@ class MusvitBackbone(nn.Module):
         bf16: bool = False,
         gradient_checkpointing: bool = False,
         max_width: int = 1024,
+        finetune_method: Literal["full", "lora"] = "full",
+        lora_rank: int = 8,
+        lora_alpha: float = 16,
+        lora_dropout: float = 0.1,
     ):
         super().__init__()
         if input_mode not in ("canvas", "interpolate"):
             raise ValueError(f"Unknown input_mode '{input_mode}'. Must be 'canvas' or 'interpolate'.")
+        if finetune_method not in ("full", "lora"):
+            raise ValueError(f"Unknown finetune_method '{finetune_method}'. Must be 'full' or 'lora'.")
         self.vit = load_musvit(model_name, token=token)
         self.model_name = model_name
         self.input_mode = input_mode
+        self.finetune_method = finetune_method
         self.bf16 = bf16
         self.canvas_size = self.vit.config.image_size
         self.patch_size = self.vit.config.patch_size
@@ -535,14 +563,33 @@ class MusvitBackbone(nn.Module):
             # Takes effect only while the ViT is in training mode, i.e. while fine-tuning
             self.vit.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
+        if finetune_method == "lora":
+            if LoraConfig is None:
+                raise ImportError("LoRA fine-tuning needs peft: pip install peft")
+            # The configuration of the MuSViT repository (experiments/staff_level_omr/train.py)
+            config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                bias="none",
+                target_modules=attention_projection_names(self.vit),
+                use_rslora=True,
+            )
+            inject_adapter_in_model(config, self.vit)
+
         self.trainable = False
         self.set_trainable(False)
 
     def set_trainable(self, trainable: bool):
-        """Freezes or unfreezes the ViT weights."""
+        """Freezes or unfreezes the ViT weights, or with LoRA only its adapters."""
         self.trainable = trainable
-        self.vit.requires_grad_(trainable)
+        for name, parameter in self.vit.named_parameters():
+            parameter.requires_grad_(trainable and (self.finetune_method == "full" or "lora_" in name))
         self.train(self.training)
+
+    def adapter_parameters(self) -> list[nn.Parameter]:
+        """The LoRA adapter weights; empty with full fine-tuning."""
+        return [p for name, p in self.vit.named_parameters() if "lora_" in name]
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -650,7 +697,7 @@ class CombinedOMRModel(nn.Module):
     Unified container wrapping either:
     - Run 1: ZeusEncoder + ZeusDecoder
     - Run 2: MusvitEncoder + ZeusDecoder (pre-extracted features)
-    - Run 3: MusvitE2EEncoder + ZeusDecoder (MuSViT backbone in the model, frozen or fine-tuned)
+    - Run 3: MusvitE2EEncoder + ZeusDecoder (MuSViT backbone in the model, frozen, fully fine-tuned or with LoRA)
     """
     def __init__(
         self,
@@ -673,6 +720,10 @@ class CombinedOMRModel(nn.Module):
         musvit_bf16: bool = False,
         gradient_checkpointing: bool = False,
         max_stave_width: int = 1024,
+        finetune_method: Literal["full", "lora"] = "full",
+        lora_rank: int = 8,
+        lora_alpha: float = 16,
+        lora_dropout: float = 0.1,
     ):
         super().__init__()
         self.encoder_type = encoder_type.lower()
@@ -690,6 +741,10 @@ class CombinedOMRModel(nn.Module):
                 bf16=musvit_bf16,
                 gradient_checkpointing=gradient_checkpointing,
                 max_width=max_stave_width,
+                finetune_method=finetune_method,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
             )
             self.encoder = MusvitE2EEncoder(backbone, dim=dim, feature_layout=feature_layout, dropout=dropout)
         else:
