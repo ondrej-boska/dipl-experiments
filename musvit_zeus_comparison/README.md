@@ -21,7 +21,7 @@ graph TD
     E -->|"Run 2 (MuSViT)"| F["Train PyTorch MuSViT + Zeus<br/>(Loads pre-extracted features)"]
     D --> G["Evaluate on Test Set<br/>(zeus.evaluation.symbol_error_rate)"]
     F --> G
-    G --> H["Combined Results Table<br/>(results_table.md & csv)"]
+    G --> H["Results Table<br/>(results_table.md & csv)"]
 ```
 
 ---
@@ -171,7 +171,7 @@ sbatch run_zeus.slurm
 sbatch run_musvit.slurm
 ```
 
-Each job outputs its own results (`zeus_results.json` and `musvit_results.json`). Whichever job finishes second automatically merges both runs into `results_table.md` and `results_table.csv`, warning if the two runs used different dataset selections.
+Each job outputs its own results (`zeus_results.json` and `musvit_results.json`). `results_table.md` and `results_table.csv` hold only the runs of the job that wrote them, so jobs sharing an `--output-dir` overwrite each other's tables.
 
 To monitor progress:
 ```bash
@@ -213,8 +213,7 @@ python -m musvit_zeus_comparison.train \
     --device cuda
 ```
 
-Before any training starts (also before the Zeus run of `--model compare`), it is checked that MuSViT features of all selected samples have been extracted with the given `--feature-stave-height` and `--feature-precision`.
-With `--model compare`, the results are exported after each run, so a finished Zeus run is kept even if the MuSViT run fails.
+Before training starts, it is checked that MuSViT features of all selected samples have been extracted with the given `--feature-stave-height` and `--feature-precision`.
 
 `--feature-layout` decides how the `(rows, 64, 768)` patch grid of a stave becomes the encoder's input sequence:
 - `columns` (default): one timestep per patch column, with the rows of that column concatenated, i.e. `(64, rows x 768)`. This keeps the vertical position (pitch) of every patch, like the Zeus encoder flattening height x channels per column.
@@ -265,7 +264,7 @@ Ways to start fine-tuning:
 
 With `--finetune-method lora`, the adapters are in the model from the start but add nothing until `--finetune-from` (they start at zero), so the frozen phase, the warmup and resuming work as with full fine-tuning. A run must be resumed with the method it started with. To LoRA-tune a model trained without LoRA, start a new run with `--init-from CKPT --finetune-method lora --finetune-from 1`: the checkpoint's backbone becomes the frozen base weights.
 
-The backbone has its own optimizer parameter group from the start, so frozen and fine-tuned checkpoints share one layout. The checkpoints include the backbone, which makes them much larger (~350 MB for MuSViT, about 3x that with the Adam state once fine-tuned). Without `--model compare`, results go to `musvit_e2e_results.json` and are merged into the results table. Use a separate `--output-dir` for each backbone or setting, since they share the `musvit_e2e_*` file names.
+The backbone has its own optimizer parameter group from the start, so frozen and fine-tuned checkpoints share one layout. The checkpoints include the backbone, which makes them much larger (~350 MB for MuSViT, about 3x that with the Adam state once fine-tuned). Results go to `musvit_e2e_results.json` and the results table. Use a separate `--output-dir` for each backbone or setting, since they share the `musvit_e2e_*` file names.
 
 `run_musvit_e2e.slurm` in the repository root trains Run 3 from scratch for 1000 epochs. It uses `interpolate` input with aspect-preserving 96 px high staves, Zeus augmentation and bf16, and fine-tunes from epoch 101. Each job resumes from the latest checkpoint, so the run is submitted as a chain of jobs (see the script's header).
 

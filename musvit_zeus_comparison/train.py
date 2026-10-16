@@ -9,7 +9,7 @@ Follows the Zeus repository workflow:
 - Run 3 (end-to-end MuSViT + Zeus): the Run 2 model with the MuSViT backbone inside, reading stave images
   instead of cached features; the backbone is frozen, or fine-tuned (fully or with LoRA) from a given epoch on.
 - Evaluation: Symbol Error Rate (SER) computed directly with zeus.evaluation.symbol_error_rate.
-- Exports results to Markdown and CSV summary tables, merging concurrent SLURM runs.
+- Exports results to Markdown and CSV summary tables.
 """
 
 from __future__ import annotations
@@ -58,10 +58,10 @@ except ImportError:
     from models import CombinedOMRModel
 
 
-RUN_INFO = {
-    "zeus": {"model": "Zeus Baseline (Run 1)", "encoder": "CNN-BiLSTM"},
-    "musvit": {"model": "MuSViT + Zeus (Run 2)", "encoder": "MuSViT + Adapter"},
-    "musvit_e2e": {"model": "MuSViT E2E + Zeus (Run 3)", "encoder": "MuSViT (in model) + Adapter"},
+RUN_NAMES = {
+    "zeus": "Zeus Baseline (Run 1)",
+    "musvit": "MuSViT + Zeus (Run 2)",
+    "musvit_e2e": "MuSViT E2E + Zeus (Run 3)",
 }
 
 
@@ -119,11 +119,6 @@ def backbone_learning_rate_at(epoch: int, args: argparse.Namespace, progress: fl
     if args.finetune_warmup_epochs > 0:
         lr *= min(1.0, (epoch - args.finetune_from + progress) / args.finetune_warmup_epochs)
     return lr
-
-
-def in_backbone_warmup(epoch: int, args: argparse.Namespace) -> bool:
-    """Whether the backbone learning rate rises during this epoch, so it is set at every step."""
-    return finetunes_backbone(epoch, args) and epoch - args.finetune_from < args.finetune_warmup_epochs
 
 
 def stave_width_arg(value: str) -> int | None:
@@ -333,32 +328,30 @@ def resolve_checkpoint(args: argparse.Namespace, model_type: str) -> Path | None
     return None
 
 
-def train_single_model(
-    model_type: str,
-    train_dataset: StaveOMRDataset,
-    val_dataset: StaveOMRDataset,
-    vocab: TokenVocabulary,
-    args: argparse.Namespace,
-    device: torch.device,
-    test_dataset: StaveOMRDataset | None = None,
-    checkpoint: dict | None = None,
-    init_checkpoint: dict | None = None,
-    musvit_dim: int = 768,
-) -> dict:
-    """
-    Trains Run 1 ('zeus'), Run 2 ('musvit') or Run 3 ('musvit_e2e') and returns metrics summary.
-    `checkpoint` resumes a run exactly; `init_checkpoint` only provides the initial weights of a new run.
-    """
-    print("\n=======================================================")
-    print(f" Starting Training: {RUN_INFO[model_type]['model']}")
-    print("=======================================================")
+def selection_metric(args: argparse.Namespace) -> str:
+    """The checkpoint is selected by validation SER; by validation loss only when SER is never evaluated."""
+    return "ser" if args.evaluation_each > 0 else "val_loss"
 
-    # Every run starts from the same seed, also when several runs share one process (--model compare)
-    set_seed(args.seed)
 
-    train_loader = make_loader(train_dataset, args, shuffle=True)
-    val_loader = make_loader(val_dataset, args, shuffle=False)
+def n_params(module: nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters())
 
+
+def describe_encoder(model_type: str, args: argparse.Namespace) -> str:
+    """Encoder column of the results table; for musvit_e2e with the backbone settings."""
+    if model_type == "zeus":
+        return "CNN-BiLSTM"
+    if model_type == "musvit":
+        return "MuSViT + Adapter"
+    method = "LoRA " if args.finetune_method == "lora" else ""
+    tuning = f"{method}fine-tuned from epoch {args.finetune_from}" if args.finetune_from is not None else "frozen"
+    width = args.stave_width or f"aspect <= {args.max_stave_width}"
+    return f"{args.musvit_model} ({args.musvit_input}, {args.feature_stave_height} x {width}, {tuning}) + Adapter"
+
+
+def build_model(
+    model_type: str, vocab: TokenVocabulary, args: argparse.Namespace, device: torch.device, musvit_dim: int
+) -> CombinedOMRModel:
     model = CombinedOMRModel(
         encoder_type=model_type,
         vocab_size=len(vocab),
@@ -384,15 +377,36 @@ def train_single_model(
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
     ).to(device)
-    backbone = model.backbone
 
-    enc_params = sum(p.numel() for p in model.encoder.parameters())
-    dec_params = sum(p.numel() for p in model.decoder.parameters())
-    total_params = enc_params + dec_params
-    backbone_str = f" (MuSViT backbone: {sum(p.numel() for p in backbone.parameters()):,})" if backbone is not None else ""
-    if backbone is not None and backbone.finetune_method == "lora":
-        backbone_str = f"{backbone_str[:-1]}, of which LoRA adapters: {sum(p.numel() for p in backbone.adapter_parameters()):,})"
-    print(f"Parameters: Encoder: {enc_params:,}{backbone_str} | Decoder: {dec_params:,} | Total: {total_params:,}")
+    enc_params, dec_params = n_params(model.encoder), n_params(model.decoder)
+    encoder_str = f"{enc_params:,}"
+    backbone = model.backbone
+    if backbone is not None:
+        lora_str = ""
+        if backbone.finetune_method == "lora":
+            lora_str = f", of which LoRA adapters: {sum(p.numel() for p in backbone.adapter_parameters()):,}"
+        encoder_str += f" (MuSViT backbone: {n_params(backbone):,}{lora_str})"
+    print(f"Parameters: Encoder: {encoder_str} | Decoder: {dec_params:,} | Total: {enc_params + dec_params:,}")
+    return model
+
+
+def train(
+    model: CombinedOMRModel,
+    model_type: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    vocab: TokenVocabulary,
+    args: argparse.Namespace,
+    device: torch.device,
+    checkpoint: dict | None = None,
+    init_checkpoint: dict | None = None,
+) -> tuple[dict, list[dict], float]:
+    """
+    Trains the model and loads the weights of the selected epoch. `checkpoint` resumes a run exactly;
+    `init_checkpoint` only provides the initial weights of a new run. Returns the metrics of the selected epoch
+    (without those not evaluated during training), the history of all epochs, and the total training time.
+    """
+    backbone = model.backbone
 
     output_dir = Path(args.output_dir)
     latest_path = output_dir / f"{model_type}_latest.pt"
@@ -417,8 +431,7 @@ def train_single_model(
     else:
         optimizer = torch.optim.AdamW(param_groups, lr=args.learning_rate, weight_decay=args.weight_decay, fused=fused)
 
-    # The checkpoint is selected by validation SER; by validation loss only when SER is never evaluated
-    select_by = "ser" if args.evaluation_each > 0 else "val_loss"
+    select_by = selection_metric(args)
 
     start_epoch = 1
     best: dict | None = None
@@ -428,18 +441,12 @@ def train_single_model(
     if checkpoint is not None:
         check_finetune_method(model, checkpoint["model"])
         model.load_state_dict(checkpoint["model"])
-        start_epoch = checkpoint.get("epoch", 0) + 1
-        if "optimizer" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            best = checkpoint["best"]
-            history = checkpoint["history"]
-            prior_train_time = checkpoint["train_time_sec"]
-            set_rng_state(checkpoint["rng"])
-        else:
-            print(
-                "Warning: this checkpoint predates optimizer-state saving. Adam moments restart from zero, "
-                "and the best-so-far record is unknown, so the next evaluated epoch becomes the best checkpoint."
-            )
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = checkpoint["epoch"] + 1
+        best = checkpoint["best"]
+        history = checkpoint["history"]
+        prior_train_time = checkpoint["train_time_sec"]
+        set_rng_state(checkpoint["rng"])
         print(f"Resumed from epoch {start_epoch - 1}.")
         if backbone is not None and history and history[-1].get("backbone_lr") and not finetunes_backbone(start_epoch, args):
             print(
@@ -449,9 +456,7 @@ def train_single_model(
     elif init_checkpoint is not None:
         load_initial_weights(model, init_checkpoint["model"])
 
-    if args.eval_only:
-        start_epoch = args.epochs + 1  # skip the training loop
-    elif start_epoch > args.epochs:
+    if start_epoch > args.epochs:
         print(f"Model already reached epoch {start_epoch - 1} >= requested target epochs {args.epochs}. Skipping training loop.")
 
     start_time = time.time()
@@ -462,22 +467,21 @@ def train_single_model(
         optimizer.param_groups[0]["lr"] = lr
         backbone_lr = None
         if backbone is not None:
-            backbone_lr = backbone_learning_rate_at(epoch, args)
-            optimizer.param_groups[1]["lr"] = backbone_lr
-            if finetunes_backbone(epoch, args) != backbone.trainable:
-                print(f"Epoch {epoch}: {'unfreezing' if finetunes_backbone(epoch, args) else 'freezing'} the MuSViT backbone.")
-            backbone.set_trainable(finetunes_backbone(epoch, args))
+            finetune = finetunes_backbone(epoch, args)
+            if finetune != backbone.trainable:
+                print(f"Epoch {epoch}: {'unfreezing' if finetune else 'freezing'} the MuSViT backbone.")
+            backbone.set_trainable(finetune)
 
         model.train()
         # Accumulated on the device, so that the CPU does not wait for the GPU after every batch
         train_loss_sum = torch.zeros((), device=device)
         train_tokens = torch.zeros((), dtype=torch.long, device=device)
 
-        warmup = backbone is not None and in_backbone_warmup(epoch, args)
         steps = len(train_loader)
         for step, batch in enumerate(train_loader):
             inputs, lengths, input_seqs, targets = to_device(batch, device)
-            if warmup:
+            if backbone is not None:
+                # Set at every step, so that the warmup after unfreezing rises smoothly
                 backbone_lr = backbone_learning_rate_at(epoch, args, (step + 1) / steps)
                 optimizer.param_groups[1]["lr"] = backbone_lr
 
@@ -546,33 +550,47 @@ def train_single_model(
 
     total_training_time = prior_train_time + time.time() - start_time
 
-    # Report all validation and test metrics from one set of weights: the selected checkpoint
-    if args.eval_only:
-        print(f"\nEvaluating the loaded checkpoint (epoch {checkpoint.get('epoch')})...")
-        best = {"epoch": checkpoint.get("epoch"), "train_loss": None, "val_loss": None, "token_acc": None, "ser": None}
-    elif best is not None and best_path.is_file():
+    # All validation and test metrics are reported from one set of weights: the selected checkpoint
+    if best is not None and best_path.is_file():
         print(f"\nLoading the selected checkpoint (epoch {best['epoch']}, by {select_by}) from: {best_path}")
         model.load_state_dict(load_checkpoint(best_path)["model"])
     else:
         print("\nNo checkpoint was selected during training; evaluating the final weights.")
-        last = history[-1] if history else {"epoch": start_epoch - 1, "train_loss": None}
-        best = {"epoch": last["epoch"], "train_loss": last["train_loss"], "val_loss": None, "token_acc": None, "ser": None}
+        if history:
+            best = {"epoch": history[-1]["epoch"], "train_loss": history[-1]["train_loss"]}
+        else:
+            best = {"epoch": start_epoch - 1}
+    return best, history, total_training_time
 
-    if best["val_loss"] is None:
+
+def evaluate(
+    model: CombinedOMRModel,
+    best: dict,
+    val_loader: DataLoader,
+    test_dataset: StaveOMRDataset | None,
+    vocab: TokenVocabulary,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict:
+    """
+    Completes the validation metrics of the selected weights, whose known ones `best` holds, and computes the
+    test SER, also per dataset (matching Zeus test evaluation). Returns the rounded metrics.
+    """
+    if best.get("val_loss") is None:
+        criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
         best["val_loss"], best["token_acc"] = evaluate_teacher_forced(model, val_loader, criterion, vocab, device)
-    if best["ser"] is None:
+    if best.get("ser") is None:
         best["ser"] = evaluate_ser(model, val_loader, vocab, device)
     print(
         f"Selected checkpoint: epoch {best['epoch']} | Val Loss: {best['val_loss']:.4f} | "
         f"Token Acc: {best['token_acc']:.2f}% | Val SER: {best['ser']:.2f}%"
     )
 
-    # Evaluate on Test Set if provided (matching Zeus test evaluation), also per dataset
     test_ser = None
     test_ser_per_dataset: dict[str, float] = {}
     if test_dataset is not None and len(test_dataset) > 0:
         print("\n=======================================================")
-        print(f" Running Test Set Evaluation for {model_type}...")
+        print(" Running Test Set Evaluation...")
         print("=======================================================")
         gold = test_dataset.gold_lmx()
         preds = predict_lmx(model, make_loader(test_dataset, args, shuffle=False), vocab, device)
@@ -586,138 +604,57 @@ def train_single_model(
                 test_ser_per_dataset[name] = symbol_error_rate([gold[i] for i in idx], [preds[i] for i in idx])
                 print(f"  - {name}: {test_ser_per_dataset[name]:.2f}%")
 
-    epochs_trained = len(history)
     return {
-        **RUN_INFO[model_type],
-        "model_type": model_type,
-        "enc_params": enc_params,
-        "dec_params": dec_params,
-        "total_params": total_params,
-        "select_by": select_by,
         "best_epoch": best["epoch"],
-        "train_loss": round(best["train_loss"], 4) if best["train_loss"] is not None else None,
+        "train_loss": round(best["train_loss"], 4) if best.get("train_loss") is not None else None,
         "val_loss": round(best["val_loss"], 4),
         "token_acc": round(best["token_acc"], 2),
         "ser": round(best["ser"], 2),
         "test_ser": round(test_ser, 2) if test_ser is not None else None,
         "test_ser_per_dataset": {k: round(v, 2) for k, v in test_ser_per_dataset.items()},
-        "epochs_trained": epochs_trained,
-        "total_time_sec": round(total_training_time, 1),
-        "avg_epoch_sec": round(total_training_time / max(1, epochs_trained), 2),
-        "history": history,
     }
 
 
-def export_results_table(results: list[dict], output_dir: str | Path):
-    """Formats and writes a comparison table to Markdown, CSV, and stdout.
-    Automatically merges with previously finished runs (e.g. when Run 1 and Run 2 are run in separate jobs).
-    """
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Save individual JSON results
-    for r in results:
-        with open(out_dir / f"{r['model_type']}_results.json", "w", encoding="utf-8") as f:
-            json.dump({k: v for k, v in r.items() if k != "history"}, f, indent=2)
-
-    # 2. Merge with a previously saved counterpart run
-    all_runs: dict[str, dict] = {}
-    for model_type in RUN_INFO:
-        cand_json = out_dir / f"{model_type}_results.json"
-        if cand_json.exists():
-            try:
-                with open(cand_json, "r", encoding="utf-8") as f:
-                    all_runs[model_type] = json.load(f)
-            except json.JSONDecodeError as e:
-                print(f"Warning: skipping unreadable results file '{cand_json}': {e}")
-    for r in results:
-        all_runs[r["model_type"]] = r
-    merged_results = [all_runs[t] for t in RUN_INFO if t in all_runs]
-
-    if len({json.dumps(r.get("datasets"), sort_keys=True) for r in merged_results}) > 1:
-        print("Warning: the merged runs use different dataset selections, so they are not directly comparable:")
-        for r in merged_results:
-            print(f"  - {r['model']}: {r.get('datasets')}")
+def export_results(result: dict, output_dir: Path):
+    """Writes the results of a run as JSON and as a one-row table to Markdown (also printed) and CSV."""
+    with open(output_dir / f"{result['model_type']}_results.json", "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
 
     def fmt_pct(value) -> str:
         return f"{value:.2f}%" if value is not None else "N/A"
 
-    has_any_test = any(r.get("test_ser") is not None for r in merged_results)
-    per_dataset_names = sorted({n for r in merged_results for n in (r.get("test_ser_per_dataset") or {})})
+    per_dataset = result["test_ser_per_dataset"]
+    headers = [
+        "Model Run", "Encoder", "Enc Params", "Dec Params", "Total Params", "Best Epoch",
+        "Val Loss", "Token Acc (%)", "Val SER (%)", "Test SER (%)",
+        *(f"Test SER {name} (%)" for name in per_dataset),
+        "Train Time (s)",
+    ]
+    row = [
+        result["model"],
+        result["encoder"],
+        f"{result['enc_params']:,}",
+        f"{result['dec_params']:,}",
+        f"{result['total_params']:,}",
+        str(result["best_epoch"]),
+        f"{result['val_loss']:.4f}",
+        fmt_pct(result["token_acc"]),
+        fmt_pct(result["ser"]),
+        fmt_pct(result["test_ser"]),
+        *(fmt_pct(v) for v in per_dataset.values()),
+        f"{result['total_time_sec']:.1f}s",
+    ]
 
-    headers = ["Model Run", "Encoder", "Enc Params", "Dec Params", "Total Params", "Best Epoch",
-               "Val Loss", "Token Acc (%)", "Val SER (%)"]
-    if has_any_test:
-        headers.append("Test SER (%)")
-        headers.extend(f"Test SER {name} (%)" for name in per_dataset_names)
-    headers.append("Train Time (s)")
+    markdown = "".join("| " + " | ".join(cells) + " |\n" for cells in (headers, ["---"] * len(headers), row))
+    print("\n" + markdown)
+    md_path = output_dir / "results_table.md"
+    md_path.write_text(markdown, encoding="utf-8")
 
-    rows = []
-    for r in merged_results:
-        row = [
-            r["model"],
-            r["encoder"],
-            f"{r['enc_params']:,}",
-            f"{r['dec_params']:,}",
-            f"{r['total_params']:,}",
-            str(r.get("best_epoch", "N/A")),
-            f"{r['val_loss']:.4f}" if r.get("val_loss") is not None else "N/A",
-            fmt_pct(r.get("token_acc")),
-            fmt_pct(r.get("ser")),
-        ]
-        if has_any_test:
-            row.append(fmt_pct(r.get("test_ser")))
-            row.extend(fmt_pct((r.get("test_ser_per_dataset") or {}).get(name)) for name in per_dataset_names)
-        row.append(f"{r['total_time_sec']:.1f}s")
-        rows.append(row)
-
-    # 1. Print formatted ASCII table to console
-    col_widths = [max(len(str(val)) for val in [h] + [r[i] for r in rows]) + 2 for i, h in enumerate(headers)]
-    sep = "+" + "+".join("-" * w for w in col_widths) + "+"
-
-    print("\n" + sep)
-    print("|" + "|".join(h.center(col_widths[i]) for i, h in enumerate(headers)) + "|")
-    print(sep)
-    for r in rows:
-        print("|" + "|".join(r[i].center(col_widths[i]) for i in range(len(r))) + "|")
-    print(sep + "\n")
-
-    # 2. Write Markdown table
-    md_path = out_dir / "results_table.md"
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write("# MuSViT vs Zeus Benchmark Comparison\n\n")
-        f.write("| " + " | ".join(headers) + " |\n")
-        f.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
-        for r in rows:
-            f.write("| " + " | ".join(r) + " |\n")
-        if "zeus" in all_runs and "musvit" in all_runs:
-            zeus_run, musvit_run = all_runs["zeus"], all_runs["musvit"]
-            f.write("\n### Key Takeaways:\n")
-            val_ser_diff = zeus_run["ser"] - musvit_run["ser"]
-            if val_ser_diff > 0:
-                f.write(f"- **MuSViT + Zeus outperforms Zeus Baseline by {val_ser_diff:.2f} pp lower Validation SER!**\n")
-            else:
-                f.write(f"- **Zeus Baseline had {-val_ser_diff:.2f} pp lower Validation SER than MuSViT + Zeus.**\n")
-
-            if zeus_run.get("test_ser") is not None and musvit_run.get("test_ser") is not None:
-                test_ser_diff = zeus_run["test_ser"] - musvit_run["test_ser"]
-                if test_ser_diff > 0:
-                    f.write(f"- **MuSViT + Zeus outperforms Zeus Baseline by {test_ser_diff:.2f} pp lower Test SER!**\n")
-                else:
-                    f.write(f"- **Zeus Baseline had {-test_ser_diff:.2f} pp lower Test SER than MuSViT + Zeus.**\n")
-
-            speed_ratio = zeus_run["total_time_sec"] / max(1e-3, musvit_run["total_time_sec"])
-            f.write(
-                f"- Training time ratio Zeus / MuSViT: **{speed_ratio:.2f}x** "
-                f"(excluding MuSViT feature extraction).\n"
-            )
-
-    # 3. Write CSV
-    csv_path = out_dir / "results_table.csv"
+    csv_path = output_dir / "results_table.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(headers)
-        writer.writerows(rows)
+        writer.writerow(row)
 
     print("Results successfully saved:")
     print(f"  - Markdown: {md_path}")
@@ -729,10 +666,10 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="compare",
-        choices=["zeus", "musvit", "musvit_e2e", "compare"],
-        help="Select 'zeus' (Run 1), 'musvit' (Run 2, cached features), 'musvit_e2e' (Run 3, MuSViT inside the model, "
-             "optionally fine-tuned), or 'compare' (runs 'zeus' and 'musvit' consecutively).",
+        required=True,
+        choices=list(RUN_NAMES),
+        help="Select 'zeus' (Run 1), 'musvit' (Run 2, cached features), or 'musvit_e2e' (Run 3, MuSViT inside the "
+             "model, optionally fine-tuned).",
     )
     # Dataset selection: every split uses the datasets' own predefined splits
     parser.add_argument("--dataset-dir", type=str, default="datasets", help="Directory containing the datasets as subfolders (default: datasets).")
@@ -805,10 +742,6 @@ def main():
     parser.add_argument("--no-tf32", action="store_true", help="Compute matrix multiplications in full FP32 instead of TF32 (TF32 runs on the tensor cores of Ampere and newer GPUs).")
 
     args = parser.parse_args()
-    if args.model == "compare" and args.resume and args.resume.lower() != "auto":
-        parser.error("--resume with a checkpoint path needs a single --model; use --resume auto with --model compare.")
-    if args.model == "compare" and args.init_from:
-        parser.error("--init-from needs a single --model.")
     if args.finetune_from is not None and args.finetune_from < 1:
         parser.error("--finetune-from must be an epoch >= 1.")
     if args.finetune_warmup_epochs < 0:
@@ -823,7 +756,7 @@ def main():
         width = getattr(args, name)
         if width is not None and (width <= 0 or width % 16 != 0):
             parser.error(f"--{name.replace('_', '-')} must be a positive multiple of 16 (the patch size), got {width}.")
-    if args.augment and args.model in ("musvit", "compare"):
+    if args.augment and args.model == "musvit":
         parser.error("--augment cannot augment the pre-extracted features of 'musvit'; use 'zeus' or 'musvit_e2e'.")
     try:
         ZeusAugmentation(args.augment)
@@ -839,8 +772,7 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    models_to_run = ["zeus", "musvit"] if args.model == "compare" else [args.model]
+    model_type = args.model
 
     # 1. Select datasets for each split and load their predefined splits.
     # Without --datasets, dev and test follow the training datasets rather than everything in --dataset-dir.
@@ -858,7 +790,7 @@ def main():
         )
 
     # The cached-feature MuSViT run alone reads pre-extracted features and never needs the images
-    keep_images = any(m != "musvit" for m in models_to_run)
+    keep_images = model_type != "musvit"
     print("Loading training datasets...")
     train_samples = load_split(train_specs, args.dataset_dir, "train", keep_images)
     print("Loading validation datasets...")
@@ -888,8 +820,8 @@ def main():
             print(f"Warning: {too_long:,} {split} sample(s) are longer than the max generation length and will be truncated.")
 
     variant = feature_variant(args.feature_stave_height, args.feature_precision)
-    if "musvit" in models_to_run:
-        # Fail now rather than hours into training (or after the whole Zeus run, with --model compare)
+    if model_type == "musvit":
+        # Fail now rather than hours into training
         missing = [
             path
             for samples in (train_samples, val_samples, test_samples)
@@ -901,75 +833,90 @@ def main():
                 f"with --stave-height {args.feature_stave_height} --precision {args.feature_precision} first."
             )
 
-    for m in models_to_run:
-        checkpoint_path = resolve_checkpoint(args, m)
-        checkpoint = None
-        if checkpoint_path is not None:
-            print(f"Loading checkpoint from: {checkpoint_path}")
-            checkpoint = load_checkpoint(checkpoint_path)
-        init_checkpoint = None
-        if args.init_from and not args.eval_only:
-            if checkpoint is not None:
-                print(f"Resuming '{checkpoint_path}', so --init-from '{args.init_from}' is ignored.")
-            else:
-                print(f"Initializing weights from: {args.init_from}")
-                init_checkpoint = load_checkpoint(Path(args.init_from))
-
-        # 2. Vocabulary from the training split (matching Zeus TokenMap), or the checkpoint's exact mapping
-        vocab_source = checkpoint or init_checkpoint
-        if vocab_source is not None:
-            vocab = TokenVocabulary.from_dict(vocab_source["vocab"])
-            unknown = {t for s in all_train for t in s.lmx.split()} - vocab.token2id.keys()
-            if unknown:
-                print(f"Warning: {len(unknown):,} training token type(s) are not in the checkpoint's vocabulary and map to <unk>.")
+    checkpoint_path = resolve_checkpoint(args, model_type)
+    checkpoint = None
+    if checkpoint_path is not None:
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        checkpoint = load_checkpoint(checkpoint_path)
+    init_checkpoint = None
+    if args.init_from and not args.eval_only:
+        if checkpoint is not None:
+            print(f"Resuming '{checkpoint_path}', so --init-from '{args.init_from}' is ignored.")
         else:
-            vocab = TokenVocabulary.build_from_samples(all_train)
-        vocab.save(output_dir / f"{m}_vocab.json")
-        print(f"Vocabulary: {len(vocab):,} unique LMX tokens.")
+            print(f"Initializing weights from: {args.init_from}")
+            init_checkpoint = load_checkpoint(Path(args.init_from))
 
-        dataset_kwargs = dict(
-            vocab=vocab,
-            mode=m,
-            feature_cache_dir=args.feature_cache_dir,
-            feature_variant=variant,
-            feature_layout=args.feature_layout,
-            preload_features=args.preload_features,
-            image_height=args.image_height,
-            max_image_width=args.max_image_width,
-            stave_height=args.feature_stave_height,
-            stave_width=args.stave_width,
-            max_stave_width=args.max_stave_width,
+    # 2. Vocabulary from the training split (matching Zeus TokenMap), or the checkpoint's exact mapping
+    vocab_source = checkpoint or init_checkpoint
+    if vocab_source is not None:
+        vocab = TokenVocabulary.from_dict(vocab_source["vocab"])
+        unknown = {t for s in all_train for t in s.lmx.split()} - vocab.token2id.keys()
+        if unknown:
+            print(f"Warning: {len(unknown):,} training token type(s) are not in the checkpoint's vocabulary and map to <unk>.")
+    else:
+        vocab = TokenVocabulary.build_from_samples(all_train)
+    vocab.save(output_dir / f"{model_type}_vocab.json")
+    print(f"Vocabulary: {len(vocab):,} unique LMX tokens.")
+
+    dataset_kwargs = dict(
+        vocab=vocab,
+        mode=model_type,
+        feature_cache_dir=args.feature_cache_dir,
+        feature_variant=variant,
+        feature_layout=args.feature_layout,
+        preload_features=args.preload_features,
+        image_height=args.image_height,
+        max_image_width=args.max_image_width,
+        stave_height=args.feature_stave_height,
+        stave_width=args.stave_width,
+        max_stave_width=args.max_stave_width,
+    )
+    train_ds = StaveOMRDataset(train_samples, **dataset_kwargs, augment=args.augment)
+    val_ds = StaveOMRDataset(val_samples, **dataset_kwargs)
+    test_ds = StaveOMRDataset(test_samples, **dataset_kwargs) if test_samples else None
+
+    musvit_dim = train_ds[0][0].shape[-1] if model_type == "musvit" else 768
+
+    # 3. Train (or load the checkpoint to evaluate) and evaluate the selected weights
+    print("\n=======================================================")
+    print(f" Starting Training: {RUN_NAMES[model_type]}")
+    print("=======================================================")
+
+    set_seed(args.seed)
+    train_loader = make_loader(train_ds, args, shuffle=True)
+    val_loader = make_loader(val_ds, args, shuffle=False)
+    model = build_model(model_type, vocab, args, device, musvit_dim)
+
+    if args.eval_only:
+        check_finetune_method(model, checkpoint["model"])
+        model.load_state_dict(checkpoint["model"])
+        print(f"\nEvaluating the loaded checkpoint (epoch {checkpoint['epoch']})...")
+        best, history, train_time = {"epoch": checkpoint["epoch"]}, checkpoint["history"], checkpoint["train_time_sec"]
+    else:
+        best, history, train_time = train(
+            model, model_type, train_loader, val_loader, vocab, args, device, checkpoint, init_checkpoint
         )
-        train_ds = StaveOMRDataset(train_samples, **dataset_kwargs, augment=args.augment)
-        val_ds = StaveOMRDataset(val_samples, **dataset_kwargs)
-        test_ds = StaveOMRDataset(test_samples, **dataset_kwargs) if test_samples else None
+    metrics = evaluate(model, best, val_loader, test_ds, vocab, args, device)
 
-        musvit_dim = train_ds[0][0].shape[-1] if m == "musvit" else 768
-
-        res = train_single_model(
-            model_type=m,
-            train_dataset=train_ds,
-            val_dataset=val_ds,
-            vocab=vocab,
-            args=args,
-            device=device,
-            test_dataset=test_ds,
-            checkpoint=checkpoint,
-            init_checkpoint=init_checkpoint,
-            musvit_dim=musvit_dim,
-        )
-        res["datasets"] = selection
-        res["augment"] = args.augment
-        if m == "musvit_e2e":
-            method = "LoRA " if args.finetune_method == "lora" else ""
-            tuning = f"{method}fine-tuned from epoch {args.finetune_from}" if args.finetune_from is not None else "frozen"
-            width = args.stave_width or f"aspect <= {args.max_stave_width}"
-            res["encoder"] = (
-                f"{args.musvit_model} ({args.musvit_input}, {args.feature_stave_height} x {width}, {tuning}) + Adapter"
-            )
-
-        # 3. Export after every run, so that a finished run is never lost to a failure of the next one
-        export_results_table([res], args.output_dir)
+    enc_params, dec_params = n_params(model.encoder), n_params(model.decoder)
+    export_results(
+        {
+            "model": RUN_NAMES[model_type],
+            "encoder": describe_encoder(model_type, args),
+            "model_type": model_type,
+            "enc_params": enc_params,
+            "dec_params": dec_params,
+            "total_params": enc_params + dec_params,
+            "select_by": selection_metric(args),
+            **metrics,
+            "epochs_trained": len(history),
+            "total_time_sec": round(train_time, 1),
+            "avg_epoch_sec": round(train_time / max(1, len(history)), 2),
+            "datasets": selection,
+            "augment": args.augment,
+        },
+        output_dir,
+    )
 
 
 if __name__ == "__main__":
