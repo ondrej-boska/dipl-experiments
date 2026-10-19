@@ -14,9 +14,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from transformers import ViTModel
+    from transformers import ViTConfig, ViTModel
 except ImportError:
-    ViTModel = None
+    ViTConfig = ViTModel = None
 
 try:
     from peft import LoraConfig, inject_adapter_in_model
@@ -495,6 +495,16 @@ def attention_projection_names(vit: nn.Module) -> list[str]:
     raise RuntimeError(f"Found no attention query/key/value projections in the ViT, only the layers {sorted(names)}.")
 
 
+def build_vit(config: dict):
+    """
+    A ViTModel of the given configuration (a ViTConfig.to_dict()) with untrained weights, as load_musvit would
+    load it, for weights that come from a checkpoint (a trained model). Nothing is downloaded.
+    """
+    if ViTModel is None:
+        raise ImportError("Please install transformers: pip install transformers")
+    return ViTModel(ViTConfig.from_dict(config), add_pooling_layer=False).eval()
+
+
 class MusvitBackbone(nn.Module):
     """
     Pre-trained MuSViT (or another ViT on the Hugging Face Hub) applied to stave bands, trainable or frozen.
@@ -516,6 +526,9 @@ class MusvitBackbone(nn.Module):
       share one layout.
 
     While frozen, it runs without gradients and stays in eval mode even when the model is trained.
+
+    With `vit_config` (a ViTConfig.to_dict()), the ViT is built with untrained weights instead of loading the
+    pre-trained `model_name`, for loading a trained model whose checkpoint holds all weights (see musibot_model.py).
     """
     def __init__(
         self,
@@ -530,13 +543,14 @@ class MusvitBackbone(nn.Module):
         lora_rank: int = 8,
         lora_alpha: float = 16,
         lora_dropout: float = 0.1,
+        vit_config: dict | None = None,
     ):
         super().__init__()
         if input_mode not in ("canvas", "interpolate"):
             raise ValueError(f"Unknown input_mode '{input_mode}'. Must be 'canvas' or 'interpolate'.")
         if finetune_method not in ("full", "lora"):
             raise ValueError(f"Unknown finetune_method '{finetune_method}'. Must be 'full' or 'lora'.")
-        self.vit = load_musvit(model_name, token=token)
+        self.vit = build_vit(vit_config) if vit_config is not None else load_musvit(model_name, token=token)
         self.model_name = model_name
         self.input_mode = input_mode
         self.finetune_method = finetune_method
@@ -724,6 +738,7 @@ class CombinedOMRModel(nn.Module):
         lora_rank: int = 8,
         lora_alpha: float = 16,
         lora_dropout: float = 0.1,
+        vit_config: dict | None = None,
     ):
         super().__init__()
         self.encoder_type = encoder_type.lower()
@@ -745,6 +760,7 @@ class CombinedOMRModel(nn.Module):
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
+                vit_config=vit_config,
             )
             self.encoder = MusvitE2EEncoder(backbone, dim=dim, feature_layout=feature_layout, dropout=dropout)
         else:

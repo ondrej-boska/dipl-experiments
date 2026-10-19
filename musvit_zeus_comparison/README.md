@@ -323,7 +323,34 @@ Encoder parameters of the MuSViT run exclude the frozen MuSViT backbone, and its
 
 ---
 
-## 6. Directory Layout
+## 6. Serving a Trained Model in Musibot
+
+`musibot_model.py` wraps a trained `zeus` or `musvit_e2e` model as a [Musibot](../musibot/docs/adding-models.md) *Model*: a process that a Musibot Worker Head starts and drives over the worker IPC. It reads one staff crop per execution and writes its transcription beside it, with the same signature as the deployed Zeus:
+`Staves/{s}/image.jpg` -> `Staves/{s}/transcription.musicxml` and `Staves/{s}/transcription.lmx`.
+
+**1. Export a checkpoint as a snapshot folder** (`model.json`, `vocab.json`, `weights.pt`):
+
+```bash
+python -m musvit_zeus_comparison.musibot_model export     experiment_results_e2e/musvit_e2e_best.pt snapshots/musvit-e2e-2026-10-15.model
+```
+
+- The snapshot is self-contained. `weights.pt` holds all weights, including the fine-tuned MuSViT backbone, and the backbone is built from the ViT configuration in `model.json`, so serving downloads nothing from Hugging Face.
+- `--name` and `--version` set what is announced to Musibot (default `zeus-baseline` / `musvit-e2e`, and the checkpoint's time and epoch, e.g. `2026-10-15-153411-e180`). Pipelines pin the version, so give a re-exported model a new one.
+- Checkpoints store their model configuration (`config`) since this was added. Older checkpoints need the `train.py` arguments that change inference: `--max-gen-length` (printed by `train.py` as *Max generation length*) is required, and `--image-height`, `--max-image-width`, `--musvit-model`, `--musvit-input`, `--stave-height`, `--stave-width`, `--max-stave-width`, `--feature-layout` default to those of `train.py`. For `musvit_e2e`, the ViT configuration of `--musvit-model` is downloaded (not its weights), which needs the Hugging Face token. Settings that change the shapes of weights are checked when the weights are loaded, but the preprocessing and the generation length are not, so pass them as the run was trained, e.g. `--musvit-input interpolate --stave-height 96 --stave-width aspect` for `run_musvit_e2e.slurm`.
+
+**2. Run it under a Worker Head** (Linux or WSL only, since the IPC passes file descriptors):
+
+```bash
+musibot-worker-head --model-command     "/path/to/venv/bin/python -m musvit_zeus_comparison.musibot_model serve --model-snapshot /path/to/snapshots/musvit-e2e-2026-10-15.model"
+```
+
+The command must run from a directory containing `musvit_zeus_comparison` (or have it on `PYTHONPATH`). `serve` takes `--device` (default: CUDA if available), `--bf16` for the backbone, and `--batch-size` for batched executions. The model is never started by hand: it needs the descriptors and the pages directory that the Worker Head passes in the environment. Its stdout and stderr become the log shown in the Musibot web UI.
+
+Resuming a `musvit_e2e` run from a checkpoint with a stored configuration no longer downloads the pre-trained MuSViT weights, since the checkpoint holds all backbone weights, frozen or fine-tuned. New runs, and `--init-from` a Run 2 checkpoint, still start from the pre-trained weights.
+
+---
+
+## 7. Directory Layout
 
 ```
 musvit_zeus_comparison/
@@ -333,6 +360,7 @@ musvit_zeus_comparison/
 ├── dataset.py           # In-memory ZeusDatasetSample loader, TokenVocabulary, StaveCollate
 ├── extract_features.py  # MuSViT feature extractor (padded 1024x1024 canvas, stave patch rows, FP16)
 ├── train.py             # Main trainer & evaluator with automated table generation
+├── musibot_model.py     # Musibot wrapper: checkpoint -> snapshot export, and the worker IPC model process
 ├── zeus/                # Embedded Zeus core modules (data, evaluation, musicorpus) and
 │                        #   their CLI: python -m musvit_zeus_comparison.zeus musicorpus|pickle
 └── README.md            # Documentation

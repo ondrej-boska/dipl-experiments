@@ -154,6 +154,45 @@ def check_finetune_method(model: CombinedOMRModel, state_dict: dict):
         )
 
 
+def model_config(model_type: str, vocab: TokenVocabulary, args: argparse.Namespace, musvit_dim: int = 768) -> dict:
+    """
+    What rebuilds the model for inference without the training data or arguments, saved in every checkpoint
+    (see musibot_model.py): the CombinedOMRModel arguments under 'model' (the ViT configuration of musvit_e2e is
+    added once the backbone is loaded) and the preprocessing of the input images under 'input'.
+    """
+    return {
+        "model": {
+            "encoder_type": model_type,
+            "vocab_size": len(vocab),
+            "dim": args.dim,
+            "timestep_width": args.timestep_width,
+            "input_height": args.image_height,
+            "musvit_dim": musvit_dim,
+            "bos_idx": vocab.bos_idx,
+            "eos_idx": vocab.eos_idx,
+            "pad_idx": vocab.pad_idx,
+            "max_length": args.max_gen_length,
+            "dropout": args.dropout,
+            "musvit_model": args.musvit_model,
+            "musvit_input": args.musvit_input,
+            "stave_height": args.feature_stave_height,
+            "feature_layout": args.feature_layout,
+            "max_stave_width": max_stave_width(args),
+            "finetune_method": args.finetune_method,
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "lora_dropout": args.lora_dropout,
+        },
+        "input": {
+            "image_height": args.image_height,
+            "max_image_width": args.max_image_width,
+            "stave_height": args.feature_stave_height,
+            "stave_width": args.stave_width,
+            "max_stave_width": args.max_stave_width,
+        },
+    }
+
+
 def load_initial_weights(model: CombinedOMRModel, state_dict: dict):
     """
     Loads the weights of another training run (--init-from). A Run 2 checkpoint (cached features) has no
@@ -254,13 +293,7 @@ def predict_lmx(model: nn.Module, loader: DataLoader, vocab: TokenVocabulary, de
         inputs, lengths, _, _ = to_device(batch, device)
         generated = model.generate(inputs, lengths)
         for idx, pred_seq in zip(indices, generated.cpu().tolist(), strict=True):
-            clean_pred = []
-            for t in pred_seq:
-                if t == vocab.eos_idx:
-                    break
-                if t not in (vocab.pad_idx, vocab.bos_idx):
-                    clean_pred.append(t)
-            pred_lmx_list[idx] = " ".join(vocab.decode(clean_pred))
+            pred_lmx_list[idx] = vocab.decode_prediction(pred_seq)
     return pred_lmx_list
 
 
@@ -278,6 +311,7 @@ def save_checkpoint(
     best: dict | None,
     history: list[dict],
     train_time_sec: float,
+    config: dict,
 ):
     """Saves everything needed to evaluate the model or to resume its training exactly."""
     torch.save(
@@ -285,6 +319,7 @@ def save_checkpoint(
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "vocab": vocab.to_dict(),
+            "config": config,
             "epoch": epoch,
             "best": best,
             "history": history,
@@ -350,44 +385,37 @@ def describe_encoder(model_type: str, args: argparse.Namespace) -> str:
 
 
 def build_model(
-    model_type: str, vocab: TokenVocabulary, args: argparse.Namespace, device: torch.device, musvit_dim: int
-) -> CombinedOMRModel:
+    model_type: str,
+    vocab: TokenVocabulary,
+    args: argparse.Namespace,
+    device: torch.device,
+    musvit_dim: int,
+    checkpoint: dict | None = None,
+) -> tuple[CombinedOMRModel, dict]:
+    """The model, and its configuration to save in checkpoints (see model_config)."""
+    config = model_config(model_type, vocab, args, musvit_dim)
+    # A resumed checkpoint holds all backbone weights (frozen ones too), so the pre-trained ones are not downloaded
+    resumed_vit_config = ((checkpoint or {}).get("config") or {}).get("model", {}).get("vit_config")
     model = CombinedOMRModel(
-        encoder_type=model_type,
-        vocab_size=len(vocab),
-        dim=args.dim,
-        timestep_width=args.timestep_width,
-        input_height=args.image_height,
-        musvit_dim=musvit_dim,
-        bos_idx=vocab.bos_idx,
-        eos_idx=vocab.eos_idx,
-        pad_idx=vocab.pad_idx,
-        max_length=args.max_gen_length,
-        dropout=args.dropout,
-        musvit_model=args.musvit_model,
-        musvit_input=args.musvit_input,
-        stave_height=args.feature_stave_height,
-        feature_layout=args.feature_layout,
+        **config["model"],
+        vit_config=resumed_vit_config,
         hf_token=args.hf_token,
         musvit_bf16=args.musvit_bf16,
         gradient_checkpointing=args.grad_checkpointing,
-        max_stave_width=max_stave_width(args),
-        finetune_method=args.finetune_method,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
     ).to(device)
 
     enc_params, dec_params = n_params(model.encoder), n_params(model.decoder)
     encoder_str = f"{enc_params:,}"
     backbone = model.backbone
     if backbone is not None:
+        # Builds the ViT without downloading the pre-trained weights, which the checkpoint replaces anyway
+        config["model"]["vit_config"] = backbone.vit.config.to_dict()
         lora_str = ""
         if backbone.finetune_method == "lora":
             lora_str = f", of which LoRA adapters: {sum(p.numel() for p in backbone.adapter_parameters()):,}"
         encoder_str += f" (MuSViT backbone: {n_params(backbone):,}{lora_str})"
     print(f"Parameters: Encoder: {encoder_str} | Decoder: {dec_params:,} | Total: {enc_params + dec_params:,}")
-    return model
+    return model, config
 
 
 def train(
@@ -398,6 +426,7 @@ def train(
     vocab: TokenVocabulary,
     args: argparse.Namespace,
     device: torch.device,
+    config: dict,
     checkpoint: dict | None = None,
     init_checkpoint: dict | None = None,
 ) -> tuple[dict, list[dict], float]:
@@ -415,6 +444,9 @@ def train(
     if args.save_snapshots:
         snapshots_dir.mkdir(parents=True, exist_ok=True)
 
+    # Label smoothing applies to the training loss only; the validation loss stays plain cross-entropy,
+    # comparable across runs
+    train_criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx, label_smoothing=args.label_smoothing)
     criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
 
     # Optimizer matching TensorFlow Zeus specification; the fused CUDA kernel updates all parameters at once.
@@ -488,7 +520,7 @@ def train(
             optimizer.zero_grad()
             logits = model(inputs, input_seqs, lengths)  # (B, L, V)
 
-            loss = criterion(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+            loss = train_criterion(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -525,14 +557,14 @@ def train(
         improved = record[select_by] is not None and (best is None or record[select_by] < best[select_by])
         if improved:
             best = {k: record[k] for k in ("epoch", "train_loss", "val_loss", "token_acc", "ser")}
-            save_checkpoint(best_path, model, optimizer, vocab, epoch, best, history, train_time)
+            save_checkpoint(best_path, model, optimizer, vocab, epoch, best, history, train_time, config)
 
-        save_checkpoint(latest_path, model, optimizer, vocab, epoch, best, history, train_time)
+        save_checkpoint(latest_path, model, optimizer, vocab, epoch, best, history, train_time, config)
 
         if args.save_snapshots and should_eval_ser:
             save_checkpoint(
                 snapshots_dir / f"{model_type}_epoch_{epoch:03d}.pt",
-                model, optimizer, vocab, epoch, best, history, train_time,
+                model, optimizer, vocab, epoch, best, history, train_time, config,
             )
 
         ser_str = f" | Val SER: {current_ser:.2f}%" if current_ser is not None else ""
@@ -728,7 +760,8 @@ def main():
     parser.add_argument("--image-height", type=int, default=96, help="Height stave images are scaled to for the Zeus encoder.")
     parser.add_argument("--max-image-width", type=int, default=1536, help="Maximum width of stave images after scaling.")
     parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate (default: 0.2 matching solo26).")
-    parser.add_argument("--augment", type=str, default="", help="Training image augmentation, as Zeus --augment, e.g. 'h:8,rotate:1,v:4,de,en3:0.2,n:0.01,c:-1:1,b:-0.5:0.2' (see augmentation.py); pixel amounts refer to the model's input image. For 'zeus' and 'musvit_e2e'. Default: none.")
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing of the training cross-entropy loss, e.g. 0.1; the validation loss is computed without it (default: 0, none).")
+    parser.add_argument("--augment",type=str, default="", help="Training image augmentation, as Zeus --augment, e.g. 'h:8,rotate:1,v:4,de,en3:0.2,n:0.01,c:-1:1,b:-0.5:0.2' (see augmentation.py); pixel amounts refer to the model's input image. For 'zeus' and 'musvit_e2e'. Default: none.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
     parser.add_argument("--length-bucket-batches", type=int, default=50, help="Training batches are formed from pools of this many batches sorted by transcription length, so that a batch holds similar lengths and the decoder wastes few steps on padding; 1 gives plain random batches.")
@@ -750,6 +783,8 @@ def main():
         args.finetune_lr = 3e-4 if args.finetune_method == "lora" else 1e-5
     if args.lora_rank < 1:
         parser.error("--lora-rank must be >= 1.")
+    if not 0.0 <= args.label_smoothing < 1.0:
+        parser.error("--label-smoothing must be in [0, 1).")
     if args.stave_width is None and args.model == "musvit_e2e" and args.musvit_input != "interpolate":
         parser.error("--stave-width aspect needs --musvit-input interpolate; the 'canvas' input is always 1024 px wide.")
     for name in ("stave_width", "max_stave_width"):
@@ -885,7 +920,7 @@ def main():
     set_seed(args.seed)
     train_loader = make_loader(train_ds, args, shuffle=True)
     val_loader = make_loader(val_ds, args, shuffle=False)
-    model = build_model(model_type, vocab, args, device, musvit_dim)
+    model, config = build_model(model_type, vocab, args, device, musvit_dim, checkpoint)
 
     if args.eval_only:
         check_finetune_method(model, checkpoint["model"])
@@ -894,7 +929,7 @@ def main():
         best, history, train_time = {"epoch": checkpoint["epoch"]}, checkpoint["history"], checkpoint["train_time_sec"]
     else:
         best, history, train_time = train(
-            model, model_type, train_loader, val_loader, vocab, args, device, checkpoint, init_checkpoint
+            model, model_type, train_loader, val_loader, vocab, args, device, config, checkpoint, init_checkpoint
         )
     metrics = evaluate(model, best, val_loader, test_ds, vocab, args, device)
 

@@ -57,6 +57,38 @@ def aspect_stave_width(image_size: tuple[int, int], height: int, max_width: int,
     return min(columns * patch_size, max_width)
 
 
+def decode_zeus_image(image_bytes: bytes, height: int = 96, max_width: int | None = 1536) -> torch.Tensor:
+    """
+    Encoded image -> (1, height, W) grayscale tensor in [0, 1] for the Zeus encoder (Run 1). The width keeps the
+    aspect ratio, capped at `max_width`. Shared by training and inference (musibot_model.py).
+    """
+    img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError("The image could not be decoded.")
+
+    h, w = img.shape
+    new_w = max(1, int(round(w * height / h)))
+    if max_width is not None:
+        new_w = min(new_w, max_width)
+
+    resized = cv2.resize(img, (new_w, height), interpolation=cv2.INTER_AREA)
+    return torch.from_numpy(resized).float().unsqueeze(0) / 255.0
+
+
+def decode_stave_band(image_bytes: bytes, height: int = 64, width: int | None = 1024, max_width: int = 2048) -> torch.Tensor:
+    """
+    Encoded image -> (3, height, width) stave band for the MuSViT backbone (Run 3), prepared as extract_features.py
+    does. With width=None, the band keeps the stave's aspect ratio (see aspect_stave_width). Shared by training and
+    inference (musibot_model.py).
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        band_width = width or aspect_stave_width(image.size, height, max_width)
+        return prepare_stave_band(image, band_width, height)
+    except OSError as e:
+        raise ValueError("The image could not be decoded.") from e
+
+
 # ==============================================================================
 # Token Vocabulary
 # ==============================================================================
@@ -105,6 +137,16 @@ class TokenVocabulary:
 
     def decode(self, ids: list[int]) -> list[str]:
         return [self.id2token.get(i, self.unk_token) for i in ids]
+
+    def decode_prediction(self, ids: list[int]) -> str:
+        """A generated token sequence as an LMX string: cut at the first EOS, without padding and BOS."""
+        clean = []
+        for t in ids:
+            if t == self.eos_idx:
+                break
+            if t not in (self.pad_idx, self.bos_idx):
+                clean.append(t)
+        return " ".join(self.decode(clean))
 
     def __len__(self) -> int:
         return len(self.token2id)
@@ -347,18 +389,10 @@ class StaveOMRDataset(Dataset):
 
     def _load_image(self, image_bytes: bytes, sample_name: str) -> torch.Tensor:
         """Loads and normalizes image for Zeus (Run 1). Height is fixed, width preserves aspect ratio."""
-        img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise ValueError(f"Could not decode the image of sample '{sample_name}'.")
-
-        h, w = img.shape
-        new_w = max(1, int(round(w * self.image_height / h)))
-        if self.max_image_width is not None:
-            new_w = min(new_w, self.max_image_width)
-
-        resized = cv2.resize(img, (new_w, self.image_height), interpolation=cv2.INTER_AREA)
-        tensor = torch.from_numpy(resized).float().unsqueeze(0) / 255.0
-        return tensor
+        try:
+            return decode_zeus_image(image_bytes, self.image_height, self.max_image_width)
+        except ValueError as e:
+            raise ValueError(f"Sample '{sample_name}': {e}") from e
 
     def __getitem__(self, item: int | tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
         """`item` is a sample index, or an (index, seed) pair to augment the sample with that seed."""
@@ -382,11 +416,9 @@ class StaveOMRDataset(Dataset):
     def _load_stave_band(self, image_bytes: bytes, sample_name: str) -> torch.Tensor:
         """Stave band for the MuSViT backbone (Run 3), prepared exactly as extract_features.py does."""
         try:
-            image = Image.open(io.BytesIO(image_bytes))
-            width = self.stave_width or aspect_stave_width(image.size, self.stave_height, self.max_stave_width)
-            return prepare_stave_band(image, width, self.stave_height)
-        except OSError as e:
-            raise ValueError(f"Could not decode the image of sample '{sample_name}': {e}") from e
+            return decode_stave_band(image_bytes, self.stave_height, self.stave_width, self.max_stave_width)
+        except ValueError as e:
+            raise ValueError(f"Sample '{sample_name}': {e}") from e
 
 
 # ==============================================================================
