@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omr-benchmark"
+version = "0.1.0"
+description = "Benchmarks of OMR models on Musicorpus datasets: a gold dataset against predicted ones, e.g. made by a Musibot model."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "musicdiff>=6.0",  # OMR-NED; brings music21 and converter21
+    "musicorpus @ git+https://github.com/OmniOMR/musicorpus.git",  # reading the datasets; on no package index
+]
+
+[project.optional-dependencies]
+# `omr-benchmark predict` runs a Musibot pipeline over a dataset. The client and the musibot-core it depends on are
+# on no package index, so both come from git; see musibot/docs/using-python-client.md.
+predict = [
+    "musibot-core @ git+https://github.com/OmniOMR/musibot.git@core/v0.3.0#subdirectory=components/core",
+    "musibot-client @ git+https://github.com/OmniOMR/musibot.git@python-client/v0.3.0#subdirectory=components/python-client",
+]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+omr-benchmark = "omr_benchmark.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["omr_benchmark*"]
+
+[tool.ruff]
+line-length = 120

@@ -29,7 +29,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 try:
-    from musvit_zeus_comparison.zeus.evaluation.symbol_error_rate import symbol_error_rate
+    from musvit_zeus_comparison.zeus.evaluation.symbol_error_rate import symbol_error_rate, tokenize
     from musvit_zeus_comparison.augmentation import ZeusAugmentation
     from musvit_zeus_comparison.dataset import (
         LengthBucketBatchSampler,
@@ -44,7 +44,7 @@ try:
     from musvit_zeus_comparison.models import CombinedOMRModel
     from musvit_zeus_comparison.predictions import write_predictions
 except ImportError:
-    from zeus.evaluation.symbol_error_rate import symbol_error_rate
+    from zeus.evaluation.symbol_error_rate import symbol_error_rate, tokenize
     from augmentation import ZeusAugmentation
     from dataset import (
         LengthBucketBatchSampler,
@@ -302,6 +302,22 @@ def predict_lmx(model: nn.Module, loader: DataLoader, vocab: TokenVocabulary, de
 def evaluate_ser(model: nn.Module, loader: DataLoader, vocab: TokenVocabulary, device: torch.device) -> float:
     """Symbol Error Rate (SER) of greedy decoding against the gold LMX, using the Zeus metric."""
     return symbol_error_rate(loader.dataset.gold_lmx(), predict_lmx(model, loader, vocab, device))
+
+
+def split_ser(dataset: StaveOMRDataset, preds: list[str]) -> tuple[float, dict[str, float]]:
+    """
+    SER of a split and of each of its source datasets. Each sample is compared only once: the SER of the split is
+    the per-dataset ones weighted by their gold token counts, which is what the corpus-level SER sums to.
+    """
+    names, gold = dataset.dataset_names(), dataset.gold_lmx()
+    per_dataset: dict[str, float] = {}
+    gold_tokens: dict[str, int] = {}
+    for name in dict.fromkeys(names):
+        idx = [i for i, n in enumerate(names) if n == name]
+        per_dataset[name] = symbol_error_rate([gold[i] for i in idx], [preds[i] for i in idx])
+        gold_tokens[name] = sum(len(tokenize(gold[i])) for i in idx)
+    ser = sum(per_dataset[name] * gold_tokens[name] for name in per_dataset) / sum(gold_tokens.values())
+    return ser, per_dataset
 
 
 def save_checkpoint(
@@ -605,6 +621,7 @@ def predictions_dir(model_type: str, args: argparse.Namespace) -> Path:
 def save_split_predictions(
     dataset: StaveOMRDataset,
     preds: list[str],
+    ser_per_dataset: dict[str, float],
     split: str,
     model_type: str,
     best: dict,
@@ -617,7 +634,7 @@ def save_split_predictions(
     """
     root = predictions_dir(model_type, args)
     print(f"\nWriting the {split} predictions as MusiCorpus datasets to '{root}'...")
-    names, sample_names, gold = dataset.dataset_names(), dataset.sample_names(), dataset.gold_lmx()
+    names, sample_names = dataset.dataset_names(), dataset.sample_names()
     for name in dict.fromkeys(names):
         idx = [i for i, n in enumerate(names) if n == name]
         write_predictions(
@@ -633,7 +650,7 @@ def save_split_predictions(
                 "dataset": name,
                 # The MusiCorpus name of the split, which omr-benchmark --split takes as well
                 "split": "validation" if split == "dev" else split,
-                "ser": round(symbol_error_rate([gold[i] for i in idx], [preds[i] for i in idx]), 2),
+                "ser": round(ser_per_dataset[name], 2),
             },
         )
 
@@ -658,10 +675,13 @@ def evaluate(
         best["val_loss"], best["token_acc"] = evaluate_teacher_forced(model, val_loader, criterion, vocab, device)
     if best.get("ser") is None or "dev" in args.save_predictions:
         val_preds = predict_lmx(model, val_loader, vocab, device)
+        val_ser, val_ser_per_dataset = split_ser(val_loader.dataset, val_preds)
         if best.get("ser") is None:
-            best["ser"] = symbol_error_rate(val_loader.dataset.gold_lmx(), val_preds)
+            best["ser"] = val_ser
         if "dev" in args.save_predictions:
-            save_split_predictions(val_loader.dataset, val_preds, "dev", model_type, best, args)
+            save_split_predictions(
+                val_loader.dataset, val_preds, val_ser_per_dataset, "dev", model_type, best, args
+            )
     print(
         f"Selected checkpoint: epoch {best['epoch']} | Val Loss: {best['val_loss']:.4f} | "
         f"Token Acc: {best['token_acc']:.2f}% | Val SER: {best['ser']:.2f}%"
@@ -673,20 +693,17 @@ def evaluate(
         print("\n=======================================================")
         print(" Running Test Set Evaluation...")
         print("=======================================================")
-        gold = test_dataset.gold_lmx()
         preds = predict_lmx(model, make_loader(test_dataset, args, shuffle=False), vocab, device)
-        test_ser = symbol_error_rate(gold, preds)
+        test_ser, ser_per_dataset = split_ser(test_dataset, preds)
         print(f"Final Test SER: {test_ser:.2f}%")
 
-        names = test_dataset.dataset_names()
-        if len(set(names)) > 1:
-            for name in dict.fromkeys(names):
-                idx = [i for i, n in enumerate(names) if n == name]
-                test_ser_per_dataset[name] = symbol_error_rate([gold[i] for i in idx], [preds[i] for i in idx])
-                print(f"  - {name}: {test_ser_per_dataset[name]:.2f}%")
+        if len(ser_per_dataset) > 1:
+            test_ser_per_dataset = ser_per_dataset
+            for name, ser in test_ser_per_dataset.items():
+                print(f"  - {name}: {ser:.2f}%")
 
         if "test" in args.save_predictions:
-            save_split_predictions(test_dataset, preds, "test", model_type, best, args)
+            save_split_predictions(test_dataset, preds, ser_per_dataset, "test", model_type, best, args)
 
     return {
         "best_epoch": best["epoch"],
