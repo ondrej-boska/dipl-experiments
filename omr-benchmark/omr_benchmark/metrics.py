@@ -47,6 +47,13 @@ class Metric(Protocol):
 
     def aggregate(self, results: list[ItemResult]) -> dict[str, float | int]: ...
 
+    def combine(self, aggregates: list[dict], scored: list[int]) -> dict[str, float | int]:
+        """
+        The aggregate of the items of several benchmarks, e.g. over two gold datasets, from their aggregates and
+        their numbers of scored items, as if the items had been aggregated together.
+        """
+        ...
+
 
 # ==============================================================================
 # OMR-NED
@@ -140,6 +147,22 @@ class OmrNed:
         return {
             "corpus_omr_ned": edit_distance / both if both else 0.0,
             "mean_omr_ned": statistics.fmean(r.values["omr_ned"] for r in scored) if scored else 0.0,
+            "gold_symbols": gold_symbols,
+            "pred_symbols": pred_symbols,
+            "edit_distance": edit_distance,
+        }
+
+    def combine(self, aggregates: list[dict], scored: list[int]) -> dict[str, float | int]:
+        gold_symbols = sum(a["gold_symbols"] for a in aggregates)
+        pred_symbols = sum(a["pred_symbols"] for a in aggregates)
+        edit_distance = sum(a["edit_distance"] for a in aggregates)
+        both = gold_symbols + pred_symbols
+        # The mean of the items is the mean of the benchmark means weighted by their items
+        items = sum(scored)
+        return {
+            "corpus_omr_ned": edit_distance / both if both else 0.0,
+            "mean_omr_ned": sum(a["mean_omr_ned"] * n for a, n in zip(aggregates, scored, strict=True)) / items
+            if items else 0.0,
             "gold_symbols": gold_symbols,
             "pred_symbols": pred_symbols,
             "edit_distance": edit_distance,

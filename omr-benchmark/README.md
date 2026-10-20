@@ -68,6 +68,19 @@ Staff-level pairing is by folder name. That is exact for staff-level models, whi
 The edit breakdown in `summary.json` sums musicdiff's edit operations over the benchmark (wrong notes, missing measures, wrong clefs, ...), which shows *what* a model gets wrong. Comparing transcriptions is CPU-bound and runs in `--jobs` processes, all CPUs by default.
 
 
+## Combining runs over several datasets
+
+`evaluate` compares with one gold dataset. To score models over several, e.g. OmniOMR and Dolores together, evaluate each dataset and combine the runs:
+
+```bash
+omr-benchmark evaluate datasets/gold/omniomr zeus/omniomr musvit/omniomr --split test -b staff-omr-ned -o results/omniomr
+omr-benchmark evaluate datasets/gold/dolores zeus/dolores musvit/dolores --split test -b staff-omr-ned -o results/dolores
+omr-benchmark combine results/omniomr results/dolores --names zeus musvit -o results/combined
+```
+
+The combination is what one benchmark over the items of all the runs would report: the corpus OMR-NED weighs each dataset by its symbols and the mean OMR-NED by its items, unlike an average of the per-dataset values. Nothing is scored again, since `summary.json` holds the sums the aggregates are made of. The predicted datasets of the runs are **matched by their position**, so every run must list the same models in the same order; the command prints which ones it combined. Without `--names`, a combined dataset is named after its runs' names joined with ` + `, and without `--output-dir` the table is only printed. Runs scored with different musicdiff versions get a warning, since their OMR-NED may differ.
+
+
 ## Predicting with Musibot
 
 `predict` runs a Musibot pipeline, or a single model through its implicit pipeline, over the gold images and writes the produced `.musicxml` and `.lmx` files (`--keep`) into the predicted dataset at the same paths. `--unit` decides what one execution gets and must fit the pipeline's signature:
@@ -82,6 +95,7 @@ The API is given by `--api-url` and `--api-token`, or by `MUSIBOT_API_URL` and `
 A benchmark is a metric applied at one level of the page to one transcription format. To add one at another level or for another format, add a `Benchmark` to `ALL_BENCHMARKS` in [benchmarks.py](omr_benchmark/benchmarks.py). A new metric is a class with the `Metric` interface in [metrics.py](omr_benchmark/metrics.py):
 - `compute(gold, pred)` scores one item, where `pred` is `None` when the prediction is missing.
 - `aggregate(results)` sums up a benchmark.
+- `combine(aggregates, scored)` sums up several benchmarks' aggregates, for `omr-benchmark combine`.
 
 The CLI, the reports and the parallel scoring pick both up without further changes.
 

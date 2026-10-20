@@ -4,11 +4,13 @@ The omr-benchmark command line:
     omr-benchmark list
     omr-benchmark evaluate GOLD PRED [PRED ...] [--benchmarks ...] [--split test] [--jobs 8] [--output-dir DIR]
     omr-benchmark predict GOLD PRED --pipeline NAME VERSION --unit staff [--split test] [--api-url URL]
+    omr-benchmark combine SUMMARY SUMMARY [...] [--names NAME ...] [--output-dir DIR]
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime
@@ -16,10 +18,11 @@ from pathlib import Path
 
 from omr_benchmark import __version__
 from omr_benchmark.benchmarks import ALL_BENCHMARKS, DEFAULT_BENCHMARKS, resolve
+from omr_benchmark.combine import combine_runs
 from omr_benchmark.dataset import open_dataset, select_pages
 from omr_benchmark.evaluate import run_benchmark
 from omr_benchmark.predict import DEFAULT_SUFFIXES, UNIT_KINDS, predict
-from omr_benchmark.report import write_prediction_results, write_summary
+from omr_benchmark.report import summary_table, write_combined_summary, write_prediction_results, write_summary
 
 
 def _unique_labels(paths: list[Path]) -> list[str]:
@@ -95,6 +98,36 @@ def predict_command(args: argparse.Namespace):
           f"{run['without_image']} without an image, in {run['seconds']}s. Recorded in '{args.pred}/prediction.json'.")
 
 
+def combine_command(args: argparse.Namespace):
+    paths = [Path(p) for p in args.summaries]
+    runs = []
+    for path in paths:
+        if path.is_dir():
+            path = path / "summary.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"There is no '{path}'.")
+        runs.append(json.loads(path.read_text(encoding="utf-8")))
+    try:
+        summaries = combine_runs(runs, args.names)
+    except ValueError as e:
+        raise SystemExit(f"omr-benchmark: {e}")
+    for label, benchmarks in summaries.items():
+        print(f"{label}: {benchmarks[0]['prediction'] if benchmarks else 'no benchmark in every run'}")
+
+    print()
+    if args.output_dir is None:
+        print(summary_table(summaries))
+        return
+    run = {
+        "combined": [str(p) for p in paths],
+        "runs": [r["run"] for r in runs],
+        "omr_benchmark_version": __version__,
+        "finished": datetime.now().isoformat(timespec="seconds"),
+    }
+    print(write_combined_summary(Path(args.output_dir), run, summaries))
+    print(f"Results written to '{args.output_dir}'.")
+
+
 def list_command(_: argparse.Namespace):
     for name, benchmark in ALL_BENCHMARKS.items():
         default = " (default)" if name in DEFAULT_BENCHMARKS else ""
@@ -141,6 +174,20 @@ def main(argv: list[str] | None = None):
     predict_parser.add_argument("--skip-existing", action="store_true",
                                 help="Skip samples that already have a prediction, e.g. to continue an interrupted run.")
     predict_parser.set_defaults(run=predict_command)
+
+    combine = commands.add_parser(
+        "combine",
+        help="Combine evaluate runs, e.g. one per gold dataset, into one benchmark over all their items.",
+        description="Combines the results of several evaluate runs, e.g. one per gold dataset, as if their items "
+                    "had been one benchmark: the corpus OMR-NED weighs each run by its symbols and the mean OMR-NED by "
+                    "its items. The predicted datasets of the runs are matched by position, so every run must list "
+                    "the same models in the same order.",
+    )
+    combine.add_argument("summaries", nargs="+", help="The summary.json of each run, or its output folder.")
+    combine.add_argument("--names", nargs="+", help="Names of the combined predicted datasets, in order "
+                                                    "(default: their names in the runs, joined with ' + ').")
+    combine.add_argument("--output-dir", "-o", help="Where to write summary.md and summary.json (default: only print).")
+    combine.set_defaults(run=combine_command)
 
     list_parser = commands.add_parser("list", help="List the benchmarks.")
     list_parser.set_defaults(run=list_command)

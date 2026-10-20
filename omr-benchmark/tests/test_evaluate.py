@@ -97,3 +97,33 @@ def test_cli_writes_reports(datasets, tmp_path, capsys):
         rows = list(csv.DictReader(f))
     assert [row["sample"] for row in rows][0] == "Staves/3"  # worst first
     assert rows[0]["status"] == MISSING
+
+
+def test_combine_matches_one_run_over_all_items(datasets, tmp_path, capsys):
+    gold, pred = datasets
+    for split in ("test", "train"):
+        main(["evaluate", str(gold), str(pred), str(gold), "--split", split, "-j", "1", "-o", str(tmp_path / split)])
+    main(["evaluate", str(gold), str(pred), str(gold), "-j", "1", "-o", str(tmp_path / "all")])
+    out = tmp_path / "combined"
+    main(["combine", str(tmp_path / "test"), str(tmp_path / "train" / "summary.json"), "--names", "pred", "gold",
+          "-o", str(out)])
+
+    combined = json.loads((out / "summary.json").read_text(encoding="utf-8"))["predictions"]
+    whole = json.loads((tmp_path / "all" / "summary.json").read_text(encoding="utf-8"))["predictions"]
+    assert set(combined) == {"pred", "gold"}
+    for name, label in (("pred", "pred"), ("gold", "TEST.Gold")):
+        for c, w in zip(combined[name], whole[label], strict=True):
+            for key in ("benchmark", "items", "ok", "missing", "unreadable", "gold_symbols", "edit_distance",
+                        "unmatched_predictions", "gold_without_transcription", "edit_breakdown"):
+                assert c[key] == w[key], key
+            assert c["corpus_omr_ned"] == pytest.approx(w["corpus_omr_ned"])
+            assert c["mean_omr_ned"] == pytest.approx(w["mean_omr_ned"])
+    assert "| pred | staff-omr-ned | 4 |" in (out / "summary.md").read_text(encoding="utf-8")
+
+
+def test_combine_needs_the_same_models(datasets, tmp_path, capsys):
+    gold, pred = datasets
+    main(["evaluate", str(gold), str(pred), "-b", "staff-omr-ned", "-j", "1", "-o", str(tmp_path / "one")])
+    main(["evaluate", str(gold), str(pred), str(gold), "-b", "staff-omr-ned", "-j", "1", "-o", str(tmp_path / "two")])
+    with pytest.raises(SystemExit, match="same models"):
+        main(["combine", str(tmp_path / "one"), str(tmp_path / "two")])

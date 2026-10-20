@@ -4,6 +4,7 @@ Writing benchmark results:
     <output dir>/
       summary.md                 # one table: every predicted dataset x benchmark
       summary.json               # the same with everything else: run settings, edit breakdowns, timings
+                                 # (also all that `omr-benchmark combine` writes, for its combined runs)
       <prediction>/<benchmark>.csv   # one row per item, worst first
       <prediction>/<benchmark>.unmatched.txt   # predicted transcriptions without a gold counterpart, if any
 """
@@ -62,6 +63,21 @@ def summary_table(summaries: dict[str, list[dict]]) -> str:
 
 
 def write_summary(output_dir: Path, run: dict, summaries: dict[str, list[dict]]):
+    split = run["split"] + (f" ({run['splits_variant']})" if run["splits_variant"] else "") if run["split"] else "all pages"
+    gold = f"Gold: `{run['gold']}`, {split}, {run['pages']} pages. {run['finished']}."
+    return _write_summary_files(output_dir, run, summaries, gold)
+
+
+def write_combined_summary(output_dir: Path, run: dict, summaries: dict[str, list[dict]]):
+    """The summary of `omr-benchmark combine`, whose run lists the runs it combines."""
+    gold = "Combined runs:\n\n" + "\n".join(
+        f"- `{r['gold']}`, {r['split'] or 'all pages'}, {r['pages']} pages (`{path}`)"
+        for path, r in zip(run["combined"], run["runs"], strict=True)
+    ) + f"\n\n{run['finished']}."
+    return _write_summary_files(output_dir, run, summaries, gold)
+
+
+def _write_summary_files(output_dir: Path, run: dict, summaries: dict[str, list[dict]], gold: str):
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary.json").write_text(
         json.dumps({"run": run, "predictions": summaries}, indent=2), encoding="utf-8"
@@ -76,10 +92,9 @@ def write_summary(output_dir: Path, run: dict, summaries: dict[str, list[dict]])
             if s["unmatched_predictions"]:
                 notes.append(f"- {prediction} / {s['benchmark']}: {s['unmatched_predictions']} predicted "
                              "transcription(s) have no gold counterpart and are not scored.")
-    split = run["split"] + (f" ({run['splits_variant']})" if run["splits_variant"] else "") if run["split"] else "all pages"
     text = (
         f"# Benchmark results\n\n"
-        f"Gold: `{run['gold']}`, {split}, {run['pages']} pages. {run['finished']}.\n\n"
+        f"{gold}\n\n"
         f"{summary_table(summaries)}\n\n"
         "OMR-NED: 0 is a perfect transcription, 1 a completely wrong one. *Corpus* divides the summed edit distances "
         "by the summed symbol counts, *Mean* averages the items. Missing and unreadable predictions are scored as "
