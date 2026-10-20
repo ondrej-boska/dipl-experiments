@@ -42,6 +42,7 @@ try:
         missing_feature_files,
     )
     from musvit_zeus_comparison.models import CombinedOMRModel
+    from musvit_zeus_comparison.predictions import write_predictions
 except ImportError:
     from zeus.evaluation.symbol_error_rate import symbol_error_rate
     from augmentation import ZeusAugmentation
@@ -56,6 +57,7 @@ except ImportError:
         missing_feature_files,
     )
     from models import CombinedOMRModel
+    from predictions import write_predictions
 
 
 RUN_NAMES = {
@@ -595,8 +597,50 @@ def train(
     return best, history, total_training_time
 
 
+def predictions_dir(model_type: str, args: argparse.Namespace) -> Path:
+    """Folder of the predicted MusiCorpus datasets, one subfolder per source dataset."""
+    return Path(args.predictions_dir) if args.predictions_dir else Path(args.output_dir) / f"{model_type}_predictions"
+
+
+def save_split_predictions(
+    dataset: StaveOMRDataset,
+    preds: list[str],
+    split: str,
+    model_type: str,
+    best: dict,
+    args: argparse.Namespace,
+):
+    """
+    Writes the predictions of a split as predicted MusiCorpus datasets, one per source dataset, for OMR-NED
+    evaluation with omr-benchmark (see predictions.py). The splits of a dataset share its folder, since they hold
+    different pages.
+    """
+    root = predictions_dir(model_type, args)
+    print(f"\nWriting the {split} predictions as MusiCorpus datasets to '{root}'...")
+    names, sample_names, gold = dataset.dataset_names(), dataset.sample_names(), dataset.gold_lmx()
+    for name in dict.fromkeys(names):
+        idx = [i for i, n in enumerate(names) if n == name]
+        write_predictions(
+            [sample_names[i] for i in idx],
+            [preds[i] for i in idx],
+            root / name,
+            run_info={
+                "model": RUN_NAMES[model_type],
+                "model_type": model_type,
+                "encoder": describe_encoder(model_type, args),
+                "output_dir": args.output_dir,
+                "epoch": best["epoch"],
+                "dataset": name,
+                # The MusiCorpus name of the split, which omr-benchmark --split takes as well
+                "split": "validation" if split == "dev" else split,
+                "ser": round(symbol_error_rate([gold[i] for i in idx], [preds[i] for i in idx]), 2),
+            },
+        )
+
+
 def evaluate(
     model: CombinedOMRModel,
+    model_type: str,
     best: dict,
     val_loader: DataLoader,
     test_dataset: StaveOMRDataset | None,
@@ -606,13 +650,18 @@ def evaluate(
 ) -> dict:
     """
     Completes the validation metrics of the selected weights, whose known ones `best` holds, and computes the
-    test SER, also per dataset (matching Zeus test evaluation). Returns the rounded metrics.
+    test SER, also per dataset (matching Zeus test evaluation). The predictions of the splits in
+    --save-predictions are written as MusiCorpus datasets. Returns the rounded metrics.
     """
     if best.get("val_loss") is None:
         criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_idx)
         best["val_loss"], best["token_acc"] = evaluate_teacher_forced(model, val_loader, criterion, vocab, device)
-    if best.get("ser") is None:
-        best["ser"] = evaluate_ser(model, val_loader, vocab, device)
+    if best.get("ser") is None or "dev" in args.save_predictions:
+        val_preds = predict_lmx(model, val_loader, vocab, device)
+        if best.get("ser") is None:
+            best["ser"] = symbol_error_rate(val_loader.dataset.gold_lmx(), val_preds)
+        if "dev" in args.save_predictions:
+            save_split_predictions(val_loader.dataset, val_preds, "dev", model_type, best, args)
     print(
         f"Selected checkpoint: epoch {best['epoch']} | Val Loss: {best['val_loss']:.4f} | "
         f"Token Acc: {best['token_acc']:.2f}% | Val SER: {best['ser']:.2f}%"
@@ -635,6 +684,9 @@ def evaluate(
                 idx = [i for i, n in enumerate(names) if n == name]
                 test_ser_per_dataset[name] = symbol_error_rate([gold[i] for i in idx], [preds[i] for i in idx])
                 print(f"  - {name}: {test_ser_per_dataset[name]:.2f}%")
+
+        if "test" in args.save_predictions:
+            save_split_predictions(test_dataset, preds, "test", model_type, best, args)
 
     return {
         "best_epoch": best["epoch"],
@@ -770,6 +822,8 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Resume training. Pass 'auto' or path to .pt checkpoint.")
     parser.add_argument("--save-snapshots", action="store_true", help="Save intermediate snapshot .pt checkpoints for evaluated epochs (matching Zeus).")
     parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate the best checkpoint (or the one given by --resume).")
+    parser.add_argument("--save-predictions", type=str, nargs="*", default=["test"], metavar="SPLIT", help="Splits ('dev' and/or 'test') whose predictions of the selected checkpoint are written as predicted MusiCorpus datasets (LMX and the MusicXML decoded from it), for OMR-NED evaluation with omr-benchmark. Pass --save-predictions without values to write none (default: test).")
+    parser.add_argument("--predictions-dir", type=str, default=None, help="Folder of the predicted MusiCorpus datasets, one subfolder per dataset (default: <output-dir>/<model>_predictions).")
     parser.add_argument("--max-gen-length", type=int, default=None, help="Max length for autoregressive decoding (default: 1.2x the longest training sequence).")
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda' or 'cpu'). Auto-detected if not specified.")
     parser.add_argument("--no-tf32", action="store_true", help="Compute matrix multiplications in full FP32 instead of TF32 (TF32 runs on the tensor cores of Ampere and newer GPUs).")
@@ -783,6 +837,11 @@ def main():
         args.finetune_lr = 3e-4 if args.finetune_method == "lora" else 1e-5
     if args.lora_rank < 1:
         parser.error("--lora-rank must be >= 1.")
+    split_names = {"dev": "dev", "val": "dev", "validation": "dev", "test": "test"}
+    unknown_splits = [s for s in args.save_predictions if s not in split_names]
+    if unknown_splits:
+        parser.error(f"--save-predictions takes 'dev' and/or 'test', got: {', '.join(unknown_splits)}.")
+    args.save_predictions = {split_names[s] for s in args.save_predictions}
     if not 0.0 <= args.label_smoothing < 1.0:
         parser.error("--label-smoothing must be in [0, 1).")
     if args.stave_width is None and args.model == "musvit_e2e" and args.musvit_input != "interpolate":
@@ -931,7 +990,7 @@ def main():
         best, history, train_time = train(
             model, model_type, train_loader, val_loader, vocab, args, device, config, checkpoint, init_checkpoint
         )
-    metrics = evaluate(model, best, val_loader, test_ds, vocab, args, device)
+    metrics = evaluate(model, model_type, best, val_loader, test_ds, vocab, args, device)
 
     enc_params, dec_params = n_params(model.encoder), n_params(model.decoder)
     export_results(

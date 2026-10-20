@@ -364,6 +364,10 @@ class StaveOMRDataset(Dataset):
         """Name of the source dataset of each sample, in dataset order."""
         return [name for name, _ in self.items]
 
+    def sample_names(self) -> list[str]:
+        """Zeus sample name of each sample, in dataset order."""
+        return [sample.sample_name for _, sample in self.items]
+
     def feature_path(self, idx: int) -> Path:
         name, sample = self.items[idx]
         return feature_cache_path(self.feature_cache_dir, name, sample.sample_name, self.feature_variant)

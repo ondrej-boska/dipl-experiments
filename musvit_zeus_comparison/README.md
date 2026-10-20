@@ -321,6 +321,36 @@ Example output (illustrative numbers):
 With several test datasets, a `Test SER <dataset> (%)` column is added for each.
 Encoder parameters of the MuSViT run exclude the frozen MuSViT backbone, and its training time excludes feature extraction.
 
+### Predictions as MusiCorpus Datasets (OMR-NED)
+The final evaluation also writes the selected checkpoint's predictions as a predicted MusiCorpus dataset per source dataset (see `predictions.py`), for MusicXML-level evaluation with [omr-benchmark](../omr-benchmark/README.md):
+
+```
+<output-dir>/<model>_predictions/<dataset>/
+  prediction.json                               # per written split: model, epoch, SER, counts, MusicXML failures
+  <page>/Staves/<n>/transcription.lmx           # predicted LMX
+  <page>/Staves/<n>/transcription.musicxml      # decoded from it with Zeus's lmx_to_musicxml
+```
+
+| Flag | Meaning |
+| :--- | :--- |
+| `--save-predictions dev test` | Splits whose predictions are written (default: `test`). Without values, none. Writing `dev` decodes the validation split once more. |
+| `--predictions-dir DIR` | Where to write them (default: `<output-dir>/<model>_predictions`). |
+
+The splits of a dataset share its folder, since they hold different pages. Predicted LMX that the decoder cannot turn into MusicXML (e.g. tokens before the first `measure`) keeps its `.lmx` but gets no `.musicxml`, so omr-benchmark scores the staff as missing (OMR-NED 1).
+For an already trained model, `--eval-only` with the run's arguments writes the predictions of its best checkpoint.
+
+**Evaluate against the normalized gold.** The conversion to Zeus replaces invisible header clefs with a G clef and invisible key signatures with C major, so the models learn to transcribe e.g. a staff with an invisible bass clef as if it were in treble clef. Against the original MusiCorpus gold, every pitch of such a staff is wrong: on Dolores.Small, the gold LMX itself, written as a prediction, scores 0.43 OMR-NED against the original gold and 0.004 against the normalized one (the remaining edits are endings and barline styles, which LMX does not encode). The normalized gold is the MusicXML the conversion wrote beside each LMX; export it as a MusiCorpus dataset with:
+
+```bash
+python -m musvit_zeus_comparison.predictions normalized-gold datasets/omniomr datasets/gold/omniomr
+
+omr-benchmark evaluate datasets/gold/omniomr \
+    experiment_results/zeus_predictions/omniomr experiment_results_e2e/musvit_e2e_predictions/omniomr \
+    --split test -b staff-omr-ned -o benchmark_results/omniomr-test
+```
+
+It reads the loose `samples/` files of the Zeus dataset folder, not the pickles, and its `splits.json` holds the pages of the `samples.<split>.txt` files. Staves the conversion skipped are not in it and are not scored.
+
 ---
 
 ## 6. Serving a Trained Model in Musibot
@@ -360,8 +390,9 @@ musvit_zeus_comparison/
 ├── dataset.py           # In-memory ZeusDatasetSample loader, TokenVocabulary, StaveCollate
 ├── extract_features.py  # MuSViT feature extractor (padded 1024x1024 canvas, stave patch rows, FP16)
 ├── train.py             # Main trainer & evaluator with automated table generation
+├── predictions.py       # Predictions as predicted MusiCorpus datasets, and the normalized gold to score them against
 ├── musibot_model.py     # Musibot wrapper: checkpoint -> snapshot export, and the worker IPC model process
-├── zeus/                # Embedded Zeus core modules (data, evaluation, musicorpus) and
+├── zeus/                # Embedded Zeus core modules (data, evaluation, musicorpus, musicxml) and
 │                        #   their CLI: python -m musvit_zeus_comparison.zeus musicorpus|pickle
 └── README.md            # Documentation
 ```
