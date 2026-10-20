@@ -62,6 +62,7 @@ python -m musvit_zeus_comparison.zeus musicorpus \
 ```
 
 The split files are named after the keys of `splits.json`; OmniOMR and Dolores call the dev split `validation`, giving `samples.validation.txt`.
+`--splits FILE` uses another splits file instead, e.g. an alternative `splits.<name>.json` of the dataset or one of your own; convert into a separate `--output` folder for each, since it becomes a separate dataset for training.
 Staves whose MusicXML cannot be converted to LMX are logged and skipped (e.g. about 3% of the OmniOMR staves on a 6-page test, due to invisible mid-staff clefs).
 The raw MusiCorpus folders can stay in `datasets/`: only folders containing pickled splits are treated as datasets by the training and extraction scripts.
 

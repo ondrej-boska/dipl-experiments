@@ -23,6 +23,7 @@ def musicorpus(args: argparse.Namespace):
         take_grandstaves=args.take_grandstaves,
         re_crop=False,
         normalize_image_height=None,
+        splits_path=Path(args.splits) if args.splits else None,
     )
 
 
@@ -49,6 +50,8 @@ def main():
     mc.add_argument("--output", required=True, help="Output Zeus dataset folder, e.g. datasets/omniomr. Must not exist yet.")
     mc.add_argument("--take-staves", action="store_true", help="Include staves as samples.")
     mc.add_argument("--take-grandstaves", action="store_true", help="Include grandstaves as samples.")
+    mc.add_argument("--splits", help="Splits file to use instead of the dataset's splits.json, e.g. "
+                                     "datasets/UFAL.OmniOMR/splits.writer-independent.json or a file anywhere else.")
     mc.set_defaults(func=musicorpus)
 
     pk = subparsers.add_parser("pickle", help="Bundle the samples of samples files into .pickle files next to them.")

@@ -17,6 +17,7 @@ def convert_musicorpus_to_zeus(
     take_grandstaves: bool,
     re_crop: bool,
     normalize_image_height: int | None,
+    splits_path: Path | None = None,
 ):
     """
     Converts a MusiCorpus dataset to a Zeus dataset.
@@ -29,13 +30,21 @@ def convert_musicorpus_to_zeus(
     :param re_crop: Crops sample images from page-level images,
         instead of using crops from the input MusiCorpus dataset.
     :param normalize_image_height: Rescale all sample images to the given height.
+    :param splits_path: The splits file to use, e.g. an alternative
+        'splits.writer-independent.json'. Defaults to the dataset's 'splits.json'.
     """
+
+    if splits_path is None:
+        splits_path = input_path / "splits.json"
+    # checked before the output folder is created, so that a typo leaves nothing behind
+    if not splits_path.is_file():
+        raise FileNotFoundError(f"There is no splits file at {splits_path}")
 
     # create the output folder
     output_path.mkdir(parents=True, exist_ok=False)
 
     # load splits
-    with open(input_path / "splits.json") as f:
+    with open(splits_path) as f:
         splits: dict[str, list[str]] = json.load(f)
 
     # define the "all" split
