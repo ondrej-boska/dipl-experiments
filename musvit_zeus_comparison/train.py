@@ -833,7 +833,7 @@ def main():
     parser.add_argument("--augment",type=str, default="", help="Training image augmentation, as Zeus --augment, e.g. 'h:8,rotate:1,v:4,de,en3:0.2,n:0.01,c:-1:1,b:-0.5:0.2' (see augmentation.py); pixel amounts refer to the model's input image. For 'zeus' and 'musvit_e2e'. Default: none.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
-    parser.add_argument("--length-bucket-batches", type=int, default=50, help="Training batches are formed from pools of this many batches sorted by transcription length, so that a batch holds similar lengths and the decoder wastes few steps on padding; 1 gives plain random batches.")
+    parser.add_argument("--length-bucket-batches", type=int, default=1, help="Training batches are formed from pools of this many batches sorted by transcription length, so that a batch holds similar lengths and the decoder wastes few steps on padding; 1 gives plain random batches.")
     parser.add_argument("--evaluation-from", type=int, default=1, help="Start evaluation with this epoch onward (matches Zeus).")
     parser.add_argument("--evaluation-each", "--eval-interval", dest="evaluation_each", type=int, default=10, help="Run validation SER evaluation every N epochs (matches Zeus). The best checkpoint is selected by it; 0 selects by validation loss instead.")
     parser.add_argument("--resume", type=str, default=None, help="Resume training. Pass 'auto' or path to .pt checkpoint.")
